@@ -14,7 +14,6 @@ from shopee_scraper.utils.constants import (
     PRODUCT_API,
 )
 from shopee_scraper.utils.logging import get_logger
-from shopee_scraper.utils.parsers import parse_price, parse_rating
 
 
 if TYPE_CHECKING:
@@ -53,6 +52,8 @@ class ProductExtractor(BaseExtractor):
         """
         Get product detail by shop_id and item_id.
 
+        Uses DOM extraction since nodriver doesn't support response interception.
+
         Args:
             shop_id: Shop ID
             item_id: Item ID
@@ -63,12 +64,8 @@ class ProductExtractor(BaseExtractor):
         logger.info("Getting product detail", shop_id=shop_id, item_id=item_id)
 
         page = await self.browser.new_page()
-        self._intercepted_data.clear()
 
         try:
-            # Setup response interception
-            page.on("response", self._handle_response)
-
             # Build product URL
             product_url = f"{BASE_URL}/product/{shop_id}/{item_id}"
 
@@ -76,19 +73,12 @@ class ProductExtractor(BaseExtractor):
             await self.browser.goto(page, product_url)
 
             # Scroll to load all content
-            await self.browser.scroll_page(page, scroll_count=2)
+            await self.browser.scroll_page(page, scroll_count=3)
 
-            # Wait for API response
-            await self.browser.random_delay(1.0, 2.0)
+            # Wait for page to fully load
+            await self.browser.random_delay(2.0, 3.0)
 
-            # Extract from intercepted API response
-            if self._intercepted_data:
-                product = self.parse(self._intercepted_data)
-                logger.info("Product extracted successfully", item_id=item_id)
-                return product
-
-            # Fallback: extract from DOM
-            logger.warning("API interception failed, using DOM extraction")
+            # Extract from DOM using JavaScript
             return await self._extract_from_dom(page, shop_id, item_id)
 
         finally:
@@ -153,53 +143,164 @@ class ProductExtractor(BaseExtractor):
         shop_id: int,
         item_id: int,
     ) -> dict[str, Any]:
-        """Fallback: Extract product from page DOM."""
+        """Extract product from page DOM using JavaScript evaluation."""
         try:
-            # Extract structured data from script tag
-            scripts = await page.query_selector_all(
-                "script[type='application/ld+json']"
-            )
-            for script in scripts:
-                content = await script.inner_text()
-                try:
-                    data = json.loads(content)
-                    if data.get("@type") == "Product":
-                        return self._parse_structured_data(data, shop_id, item_id)
-                except json.JSONDecodeError:
-                    continue
+            # Use JavaScript to extract all product data at once
+            raw_data = await page.evaluate("""
+                (() => {
+                    const result = {
+                        name: '',
+                        description: '',
+                        price: 0,
+                        price_text: '',
+                        stock: 0,
+                        sold: 0,
+                        rating: 0,
+                        rating_count: 0,
+                        images: [],
+                        shop_name: '',
+                        shop_location: '',
+                        is_official: false,
+                        category_path: [],
+                        variations: [],
+                        attributes: []
+                    };
 
-            # Manual extraction
+                    // Try JSON-LD structured data first
+                    const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+                    for (const script of scripts) {
+                        try {
+                            const data = JSON.parse(script.textContent);
+                            if (data['@type'] === 'Product') {
+                                result.name = data.name || '';
+                                result.description = data.description || '';
+                                if (data.offers) {
+                                    result.price = parseFloat(data.offers.price) || 0;
+                                }
+                                if (data.aggregateRating) {
+                                    result.rating = parseFloat(data.aggregateRating.ratingValue) || 0;
+                                    result.rating_count = parseInt(data.aggregateRating.reviewCount) || 0;
+                                }
+                                if (data.image) {
+                                    result.images = Array.isArray(data.image) ? data.image : [data.image];
+                                }
+                            }
+                        } catch(e) {}
+                    }
+
+                    // Extract from page content if JSON-LD is incomplete
+                    const allText = document.body.innerText || '';
+
+                    // Name from title or h1
+                    if (!result.name) {
+                        const titleEl = document.querySelector('h1, [class*="product-title"], [class*="title"]');
+                        if (titleEl) result.name = titleEl.innerText.trim();
+                    }
+
+                    // Price
+                    if (!result.price) {
+                        const priceMatch = allText.match(/Rp\\s*([\\d.,]+)/);
+                        if (priceMatch) {
+                            result.price_text = priceMatch[0];
+                            result.price = parseFloat(priceMatch[1].replace(/\\./g, '').replace(',', '.')) || 0;
+                        }
+                    }
+
+                    // Stock
+                    const stockMatch = allText.match(/(?:Stok|Stock)[:\\s]*(\\d+)/i);
+                    if (stockMatch) result.stock = parseInt(stockMatch[1]) || 0;
+
+                    // Sold
+                    const soldMatch = allText.match(/(\\d+[\\d.,]*[kKrRbB]*)\\s*(?:Terjual|sold)/i);
+                    if (soldMatch) {
+                        let sold = soldMatch[1].toLowerCase();
+                        if (sold.includes('rb') || sold.includes('k')) {
+                            result.sold = parseFloat(sold) * 1000;
+                        } else {
+                            result.sold = parseInt(sold.replace(/\\./g, '')) || 0;
+                        }
+                    }
+
+                    // Rating
+                    if (!result.rating) {
+                        const ratingMatch = allText.match(/(\\d+[.,]?\\d*)\\s*(?:\\/\\s*5|dari\\s*5|out of 5)/i);
+                        if (ratingMatch) result.rating = parseFloat(ratingMatch[1].replace(',', '.')) || 0;
+                    }
+
+                    // Images
+                    if (result.images.length === 0) {
+                        const imgEls = document.querySelectorAll('[class*="product"] img, [class*="gallery"] img, [class*="carousel"] img');
+                        imgEls.forEach(img => {
+                            const src = img.src || img.getAttribute('src');
+                            if (src && src.includes('shopee') && !src.includes('thumb') && result.images.length < 8) {
+                                result.images.push(src);
+                            }
+                        });
+                    }
+
+                    // Shop info
+                    const shopEl = document.querySelector('[class*="shop-name"], [class*="seller-name"]');
+                    if (shopEl) result.shop_name = shopEl.innerText.trim();
+
+                    const locEl = document.querySelector('[class*="location"], [class*="shop-location"]');
+                    if (locEl) result.shop_location = locEl.innerText.trim();
+
+                    // Check official shop
+                    if (allText.includes('Official Shop') || allText.includes('Mall')) {
+                        result.is_official = true;
+                    }
+
+                    // Description
+                    if (!result.description) {
+                        const descEl = document.querySelector('[class*="description"], [class*="product-detail"]');
+                        if (descEl) result.description = descEl.innerText.trim().substring(0, 2000);
+                    }
+
+                    return JSON.stringify(result);
+                })()
+            """)
+
+            # Parse JSON result
+            if isinstance(raw_data, str):
+                try:
+                    raw_data = json.loads(raw_data)
+                except json.JSONDecodeError:
+                    raw_data = {}
+
+            if not raw_data:
+                return {}
+
+            # Build product dict compatible with transform_product
             product = {
                 "item_id": item_id,
                 "shop_id": shop_id,
+                "name": raw_data.get("name", ""),
+                "description": raw_data.get("description", ""),
+                "price": raw_data.get("price", 0),
+                "stock": raw_data.get("stock", 0),
+                "sold": raw_data.get("sold", 0),
+                "rating": raw_data.get("rating", 0),
+                "rating_count": raw_data.get("rating_count", 0),
+                "rating_breakdown": [],
+                "images": raw_data.get("images", []),
+                "variations": [],
+                "variants": [],
+                "category_id": 0,
+                "category_path": raw_data.get("category_path", []),
+                "attributes": raw_data.get("attributes", []),
+                "condition": "new",
+                "shop": {
+                    "shop_id": shop_id,
+                    "name": raw_data.get("shop_name", ""),
+                    "username": "",
+                    "location": raw_data.get("shop_location", ""),
+                    "is_official": raw_data.get("is_official", False),
+                    "is_preferred_plus": False,
+                },
                 "url": f"{BASE_URL}/product/{shop_id}/{item_id}",
             }
 
-            # Name
-            name_el = await page.query_selector("[class*='product-title'], h1")
-            if name_el:
-                product["name"] = await name_el.inner_text()
-
-            # Price
-            price_el = await page.query_selector("[class*='price'] span")
-            if price_el:
-                price_text = await price_el.inner_text()
-                product["price"] = parse_price(price_text)
-
-            # Rating
-            rating_el = await page.query_selector("[class*='rating']")
-            if rating_el:
-                rating_text = await rating_el.inner_text()
-                product["rating"] = parse_rating(rating_text)
-
-            # Images
-            img_els = await page.query_selector_all("[class*='product-image'] img")
-            product["images"] = []
-            for img in img_els[:5]:  # Limit to 5 images
-                src = await img.get_attribute("src")
-                if src:
-                    product["images"].append(src)
-
+            logger.info("Product extracted via DOM", item_id=item_id, name=product["name"][:30] if product["name"] else "")
             return product
 
         except Exception as e:

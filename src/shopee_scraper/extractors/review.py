@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -52,7 +53,7 @@ class ReviewExtractor(BaseExtractor):
         rating_filter: int = 0,
     ) -> list[dict[str, Any]]:
         """
-        Get reviews for a product.
+        Get reviews for a product using DOM extraction.
 
         Args:
             shop_id: Shop ID
@@ -71,64 +72,129 @@ class ReviewExtractor(BaseExtractor):
             max_reviews=max_reviews,
         )
 
-        all_reviews: list[dict[str, Any]] = []
         page = await self.browser.new_page()
-        self._intercepted_data.clear()
 
         try:
-            # Setup response interception
-            page.on("response", self._handle_response)
-
-            # Navigate to product page reviews section
+            # Navigate to product page
             product_url = f"{BASE_URL}/product/{shop_id}/{item_id}"
             await self.browser.goto(page, product_url)
 
-            # Scroll to reviews section
-            await self._scroll_to_reviews(page)
+            # Scroll down to load reviews section
+            await self.browser.scroll_page(page, scroll_count=5)
+            await self.browser.random_delay(2.0, 3.0)
 
-            # Click on reviews tab if needed
-            await self._click_reviews_tab(page)
+            # Extract reviews from DOM using JavaScript
+            raw_reviews = await page.evaluate("""
+                (() => {
+                    const reviews = [];
 
-            # Wait for reviews to load
-            await self.browser.random_delay(1.0, 2.0)
+                    // Find review containers
+                    const reviewSelectors = [
+                        '[class*="shopee-product-rating"]',
+                        '[class*="product-rating-overview"]',
+                        '[class*="rating-comment"]',
+                        '[class*="review-item"]',
+                        '[class*="rating-item"]'
+                    ];
 
-            # Extract reviews with pagination
-            offset = 0
-            per_page = 6  # Shopee loads 6 reviews at a time
+                    let reviewItems = [];
+                    for (const sel of reviewSelectors) {
+                        reviewItems = document.querySelectorAll(sel);
+                        if (reviewItems.length > 0) break;
+                    }
 
-            while len(all_reviews) < max_reviews:
-                # Check intercepted data
-                if self._intercepted_data:
-                    for data in self._intercepted_data:
-                        reviews = self._parse_api_response(data)
-                        for review in reviews:
-                            if review not in all_reviews:
-                                all_reviews.append(review)
+                    // Extract from each review item
+                    reviewItems.forEach((item, idx) => {
+                        try {
+                            const text = item.innerText || '';
 
-                    self._intercepted_data.clear()
+                            // Extract rating (stars)
+                            let rating = 5;
+                            const stars = item.querySelectorAll('[class*="star"], [class*="icon-star"]');
+                            if (stars.length > 0) {
+                                rating = Math.min(stars.length, 5);
+                            }
+                            const ratingMatch = text.match(/(\\d)\\s*(?:star|bintang)/i);
+                            if (ratingMatch) rating = parseInt(ratingMatch[1]);
 
-                    logger.info(f"Collected {len(all_reviews)} reviews so far")
+                            // Extract username
+                            let username = 'Anonymous';
+                            const userEl = item.querySelector('[class*="username"], [class*="author"], [class*="name"]');
+                            if (userEl) username = userEl.innerText.trim();
 
-                    if len(all_reviews) >= max_reviews:
-                        break
+                            // Extract comment
+                            let comment = '';
+                            const commentEl = item.querySelector('[class*="comment"], [class*="content"], [class*="text"]');
+                            if (commentEl) comment = commentEl.innerText.trim();
 
-                # Try to load more reviews
-                more_loaded = await self._load_more_reviews(page)
-                if not more_loaded:
-                    logger.info("No more reviews to load")
-                    break
+                            // Extract date
+                            let date = '';
+                            const dateMatch = text.match(/\\d{1,2}[\\/-]\\d{1,2}[\\/-]\\d{2,4}/);
+                            if (dateMatch) date = dateMatch[0];
 
-                offset += per_page
-                await self.browser.random_delay(1.0, 2.0)
+                            // Extract images
+                            const images = [];
+                            const imgEls = item.querySelectorAll('img');
+                            imgEls.forEach(img => {
+                                const src = img.src || '';
+                                if (src && src.includes('shopee') && !src.includes('avatar')) {
+                                    images.push(src);
+                                }
+                            });
 
-            # Trim to max
-            all_reviews = all_reviews[:max_reviews]
+                            if (comment || rating) {
+                                reviews.push({
+                                    index: idx,
+                                    username: username,
+                                    rating: rating,
+                                    comment: comment.substring(0, 1000),
+                                    date: date,
+                                    images: images
+                                });
+                            }
+                        } catch(e) {}
+                    });
+
+                    return JSON.stringify(reviews);
+                })()
+            """)
+
+            # Parse JSON result
+            all_reviews: list[dict[str, Any]] = []
+            if isinstance(raw_reviews, str):
+                try:
+                    parsed = json.loads(raw_reviews)
+                    for raw in parsed[:max_reviews]:
+                        review = {
+                            "rating_id": raw.get("index", 0),
+                            "item_id": item_id,
+                            "shop_id": shop_id,
+                            "order_id": 0,
+                            "author": {
+                                "user_id": 0,
+                                "username": raw.get("username", "Anonymous"),
+                                "avatar": "",
+                            },
+                            "rating": raw.get("rating", 5),
+                            "comment": raw.get("comment", ""),
+                            "variation": "",
+                            "images": raw.get("images", []),
+                            "videos": [],
+                            "likes": 0,
+                            "shop_reply": "",
+                            "is_anonymous": False,
+                            "created_at": raw.get("date", ""),
+                            "tags": [],
+                        }
+                        all_reviews.append(review)
+                except json.JSONDecodeError:
+                    pass
+
+            logger.info(f"Review extraction completed: {len(all_reviews)} reviews")
+            return all_reviews
 
         finally:
             await self.browser.close_page(page)
-
-        logger.info(f"Review extraction completed: {len(all_reviews)} reviews")
-        return all_reviews
 
     async def get_reviews_summary(
         self,
@@ -152,14 +218,48 @@ class ReviewExtractor(BaseExtractor):
         try:
             product_url = f"{BASE_URL}/product/{shop_id}/{item_id}"
             await self.browser.goto(page, product_url)
-            await self._scroll_to_reviews(page)
+            await self.browser.scroll_page(page, scroll_count=3)
             await self.browser.random_delay(1.0, 2.0)
 
-            # Extract summary from page
-            summary = await self._extract_review_summary(page)
+            # Extract summary using JavaScript
+            raw_summary = await page.evaluate("""
+                (() => {
+                    const result = {
+                        total_reviews: 0,
+                        average_rating: 0,
+                        rating_breakdown: {}
+                    };
+
+                    const allText = document.body.innerText || '';
+
+                    // Rating
+                    const ratingMatch = allText.match(/(\\d+[.,]?\\d*)\\s*(?:dari\\s*5|\\/\\s*5)/i);
+                    if (ratingMatch) {
+                        result.average_rating = parseFloat(ratingMatch[1].replace(',', '.')) || 0;
+                    }
+
+                    // Total reviews
+                    const reviewMatch = allText.match(/(\\d+[.,]?\\d*[kKrRbB]*)\\s*(?:Penilaian|Review|Ulasan)/i);
+                    if (reviewMatch) {
+                        let count = reviewMatch[1].toLowerCase();
+                        if (count.includes('rb') || count.includes('k')) {
+                            result.total_reviews = parseFloat(count) * 1000;
+                        } else {
+                            result.total_reviews = parseInt(count.replace(/\\./g, '')) || 0;
+                        }
+                    }
+
+                    return JSON.stringify(result);
+                })()
+            """)
+
+            summary = {"total_reviews": 0, "average_rating": 0.0, "rating_breakdown": {}}
+            if isinstance(raw_summary, str):
+                with contextlib.suppress(json.JSONDecodeError):
+                    summary = json.loads(raw_summary)
+
             summary["shop_id"] = shop_id
             summary["item_id"] = item_id
-
             return summary
 
         finally:
