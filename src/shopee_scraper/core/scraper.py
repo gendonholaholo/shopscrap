@@ -10,10 +10,12 @@ from shopee_scraper.core.session import SessionManager
 from shopee_scraper.extractors.product import ProductExtractor
 from shopee_scraper.extractors.review import ReviewExtractor
 from shopee_scraper.extractors.search import SearchExtractor
+from shopee_scraper.models.output import ProductOutput
 from shopee_scraper.storage.json_storage import JsonStorage
 from shopee_scraper.utils.captcha_solver import create_captcha_solver
 from shopee_scraper.utils.logging import get_logger
 from shopee_scraper.utils.proxy import ProxyPool, load_proxies_from_env
+from shopee_scraper.utils.transformer import create_export, transform_product
 
 
 logger = get_logger(__name__)
@@ -164,32 +166,88 @@ class ShopeeScraper:
         max_pages: int = 1,
         sort_by: str = "relevancy",
         save: bool = True,
-    ) -> list[dict[str, Any]]:
+        max_reviews: int = 5,
+    ) -> list[ProductOutput]:
         """
-        Search products by keyword.
+        Search products by keyword with full details and reviews.
+
+        Automatically fetches product details and reviews for each search result.
 
         Args:
             keyword: Search keyword
             max_pages: Maximum pages to scrape
             sort_by: Sort order (relevancy, sales, price_asc, price_desc)
             save: Save results to file
+            max_reviews: Maximum reviews to fetch per product
 
         Returns:
-            List of product dictionaries
+            List of ProductOutput instances
         """
         await self._ensure_started()
 
         logger.info(f"Searching for: {keyword}")
 
-        products = await self._search_extractor.search(
+        # Get search results (basic info: item_id, shop_id)
+        search_results = await self._search_extractor.search(
             keyword=keyword,
             max_pages=max_pages,
             sort_by=sort_by,
         )
 
+        logger.info(f"Found {len(search_results)} items, fetching details...")
+
+        # Fetch full details and reviews for each product
+        products: list[ProductOutput] = []
+        for idx, item in enumerate(search_results):
+            shop_id = item.get("shop_id")
+            item_id = item.get("item_id")
+
+            if not shop_id or not item_id:
+                continue
+
+            logger.info(
+                f"Fetching details [{idx + 1}/{len(search_results)}]: {item_id}"
+            )
+
+            try:
+                # Get product details
+                product_data = await self._product_extractor.get_product(
+                    shop_id=shop_id,
+                    item_id=item_id,
+                )
+
+                if not product_data:
+                    logger.warning(f"No product data for {item_id}")
+                    continue
+
+                # Get reviews
+                reviews_data = []
+                if max_reviews > 0:
+                    try:
+                        reviews_data = await self._review_extractor.get_reviews(
+                            shop_id=shop_id,
+                            item_id=item_id,
+                            max_reviews=max_reviews,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to get reviews for {item_id}: {e}")
+
+                # Transform to output format
+                product_output = transform_product(product_data, reviews_data)
+                products.append(product_output)
+
+                # Rate limiting between requests
+                await self.browser.random_delay(2.0, 4.0)
+
+            except Exception as e:
+                logger.error(f"Failed to get product {item_id}: {e}")
+
+        logger.info(f"Completed: {len(products)}/{len(search_results)} products")
+
         if save and products:
+            export = create_export(products)
             filename = f"search_{self._sanitize_filename(keyword)}"
-            path = await self.storage.save(products, filename)
+            path = await self.storage.save(export, filename)
             logger.info(f"Results saved to: {path}")
 
         return products
@@ -203,89 +261,52 @@ class ShopeeScraper:
         shop_id: int,
         item_id: int,
         save: bool = True,
-    ) -> dict[str, Any]:
+        max_reviews: int = 5,
+    ) -> ProductOutput | dict[str, Any]:
         """
-        Get product detail.
+        Get product detail with reviews.
 
         Args:
             shop_id: Shop ID
             item_id: Item ID
             save: Save result to file
+            max_reviews: Maximum reviews to fetch
 
         Returns:
-            Product detail dictionary
+            ProductOutput instance
         """
         await self._ensure_started()
 
-        product = await self._product_extractor.get_product(
+        product_data = await self._product_extractor.get_product(
             shop_id=shop_id,
             item_id=item_id,
         )
 
-        if save and product:
+        if not product_data:
+            return {}
+
+        # Get reviews
+        reviews_data = []
+        if max_reviews > 0:
+            try:
+                reviews_data = await self._review_extractor.get_reviews(
+                    shop_id=shop_id,
+                    item_id=item_id,
+                    max_reviews=max_reviews,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to get reviews for {item_id}: {e}")
+
+        # Transform to output format
+        product = transform_product(product_data, reviews_data)
+
+        if save:
+            export = create_export([product])
             filename = f"product_{shop_id}_{item_id}"
-            path = await self.storage.save([product], filename)
+            path = await self.storage.save(export, filename)
             logger.info(f"Product saved to: {path}")
 
         return product
-
-    async def get_products_from_search(
-        self,
-        keyword: str,
-        max_products: int = 10,
-        save: bool = True,
-    ) -> list[dict[str, Any]]:
-        """
-        Search and get full details for each product.
-
-        Args:
-            keyword: Search keyword
-            max_products: Maximum products to get details for
-            save: Save results to file
-
-        Returns:
-            List of detailed product dictionaries
-        """
-        await self._ensure_started()
-
-        # First, search for products
-        search_results = await self.search(
-            keyword=keyword,
-            max_pages=(max_products // 60) + 1,
-            save=False,
-        )
-
-        # Limit to max_products
-        search_results = search_results[:max_products]
-
-        # Get full details for each
-        products = []
-        for item in search_results:
-            shop_id = item.get("shop_id")
-            item_id = item.get("item_id")
-
-            if shop_id and item_id:
-                try:
-                    product = await self.get_product(
-                        shop_id=shop_id,
-                        item_id=item_id,
-                        save=False,
-                    )
-                    if product:
-                        products.append(product)
-
-                    # Rate limiting
-                    await self.browser.random_delay(2.0, 4.0)
-
-                except Exception as e:
-                    logger.error(f"Failed to get product {item_id}: {e}")
-
-        if save and products:
-            filename = f"products_{self._sanitize_filename(keyword)}"
-            path = await self.storage.save(products, filename)
-            logger.info(f"Products saved to: {path}")
-
-        return products
 
     # =========================================================================
     # Review Operations

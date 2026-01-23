@@ -32,8 +32,10 @@ def run_async(coro):
     return asyncio.run(coro)
 
 
-def display_products(products: list[dict], limit: int = 10) -> None:
+def display_products(products: list, limit: int = 10) -> None:
     """Display products in a table."""
+    from shopee_scraper.models.output import ProductOutput
+
     table = Table(title=f"Products Found: {len(products)}")
     table.add_column("Item ID", style="cyan")
     table.add_column("Name", style="white", max_width=40)
@@ -42,12 +44,26 @@ def display_products(products: list[dict], limit: int = 10) -> None:
     table.add_column("Rating", style="magenta")
 
     for product in products[:limit]:
+        # Handle both ProductOutput objects and dicts
+        if isinstance(product, ProductOutput):
+            item_id = product.id
+            name = product.title[:40]
+            price = product.price
+            sold = product.soldCount
+            rating = product.rating
+        else:
+            item_id = str(product.get("item_id", ""))
+            name = product.get("name", "")[:40]
+            price = product.get("price", 0)
+            sold = product.get("sold", 0)
+            rating = product.get("rating", 0)
+
         table.add_row(
-            str(product.get("item_id", "")),
-            product.get("name", "")[:40],
-            f"Rp{product.get('price', 0):,.0f}",
-            str(product.get("sold", 0)),
-            f"{product.get('rating', 0):.1f}",
+            str(item_id),
+            name,
+            f"Rp{price:,.0f}",
+            str(sold),
+            f"{rating:.1f}",
         )
 
     console.print(table)
@@ -147,6 +163,7 @@ def product(
         setup_logging(level="DEBUG" if verbose else "INFO")
 
         from shopee_scraper.core.scraper import ShopeeScraper
+        from shopee_scraper.models.output import ProductOutput
 
         console.print(f"[bold]Getting product:[/bold] {shop_id}/{item_id}\n")
 
@@ -154,11 +171,21 @@ def product(
             prod = await scraper.get_product(shop_id=shop_id, item_id=item_id)
 
             if prod:
-                console.print(f"[cyan]Name:[/cyan] {prod.get('name', 'N/A')}")
-                console.print(f"[green]Price:[/green] Rp{prod.get('price', 0):,.0f}")
-                console.print(f"[yellow]Stock:[/yellow] {prod.get('stock', 0)}")
-                console.print(f"[magenta]Sold:[/magenta] {prod.get('sold', 0)}")
-                console.print(f"[blue]Rating:[/blue] {prod.get('rating', 0):.1f}")
+                # Handle both ProductOutput and dict
+                if isinstance(prod, ProductOutput):
+                    console.print(f"[cyan]Name:[/cyan] {prod.title}")
+                    console.print(f"[green]Price:[/green] Rp{prod.price:,}")
+                    console.print(f"[yellow]Stock:[/yellow] {prod.stock}")
+                    console.print(f"[magenta]Sold:[/magenta] {prod.soldCount}")
+                    console.print(f"[blue]Rating:[/blue] {prod.rating:.1f}")
+                else:
+                    console.print(f"[cyan]Name:[/cyan] {prod.get('name', 'N/A')}")
+                    console.print(
+                        f"[green]Price:[/green] Rp{prod.get('price', 0):,.0f}"
+                    )
+                    console.print(f"[yellow]Stock:[/yellow] {prod.get('stock', 0)}")
+                    console.print(f"[magenta]Sold:[/magenta] {prod.get('sold', 0)}")
+                    console.print(f"[blue]Rating:[/blue] {prod.get('rating', 0):.1f}")
                 console.print(f"\n[green]✓[/green] Saved to: {output}/")
             else:
                 console.print("[red]Product not found[/red]")
@@ -264,70 +291,41 @@ def login(
 @app.command()
 def scrape(
     keyword: str = typer.Argument(..., help="Search keyword"),
-    limit: int = typer.Option(
-        10, "--limit", "-l", help="Maximum products to get details"
-    ),
+    pages: int = typer.Option(1, "--pages", "-p", help="Number of pages to scrape"),
     output: str = typer.Option(
         "./data/output", "--output", "-o", help="Output directory"
     ),
     headless: bool = typer.Option(
         True, "--headless/--no-headless", help="Run headless"
     ),
-    with_reviews: bool = typer.Option(
-        False, "--with-reviews", "-r", help="Also get reviews"
+    max_reviews: int = typer.Option(
+        5, "--max-reviews", "-r", help="Max reviews per product (0 to skip)"
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ) -> None:
-    """Search and get full details for products."""
+    """Search and get full details for products (with reviews)."""
 
     async def _scrape():
         setup_logging(level="DEBUG" if verbose else "INFO")
 
         from shopee_scraper.core.scraper import ShopeeScraper
-        from shopee_scraper.storage.json_storage import JsonStorage
 
         console.print(f"[bold]Scraping:[/bold] {keyword}")
-        console.print(f"[dim]Limit: {limit}, Reviews: {with_reviews}[/dim]\n")
-
-        storage = JsonStorage(output_dir=output)
+        console.print(
+            f"[dim]Pages: {pages}, Max reviews per product: {max_reviews}[/dim]\n"
+        )
 
         async with ShopeeScraper(headless=headless, output_dir=output) as scraper:
-            # Get products with full details
-            products = await scraper.get_products_from_search(
+            # Search now automatically fetches full details and reviews
+            products = await scraper.search(
                 keyword=keyword,
-                max_products=limit,
+                max_pages=pages,
+                max_reviews=max_reviews,
                 save=True,
             )
 
             if products:
                 display_products(products)
-
-                # Optionally get reviews for each product
-                if with_reviews:
-                    console.print("\n[bold]Getting reviews...[/bold]\n")
-                    all_reviews = []
-
-                    for prod in products:
-                        shop_id = prod.get("shop_id")
-                        item_id = prod.get("item_id")
-
-                        if shop_id and item_id:
-                            revs = await scraper.get_reviews(
-                                shop_id=shop_id,
-                                item_id=item_id,
-                                max_reviews=20,
-                                save=False,
-                            )
-                            all_reviews.extend(revs)
-
-                    if all_reviews:
-                        # Save all reviews
-                        filename = f"reviews_{keyword.replace(' ', '_')}"
-                        await storage.save(all_reviews, filename)
-                        console.print(
-                            f"[green]✓[/green] {len(all_reviews)} reviews saved"
-                        )
-
                 console.print(f"\n[green]✓[/green] Output saved to: {output}/")
             else:
                 console.print("[yellow]No products found[/yellow]")

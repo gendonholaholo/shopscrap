@@ -8,6 +8,7 @@ from typing import Any
 
 import aiofiles
 
+from shopee_scraper.models.output import ExportOutput
 from shopee_scraper.storage.base import BaseStorage
 
 
@@ -18,16 +19,33 @@ class JsonStorage(BaseStorage):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    async def save(self, data: list[dict[str, Any]], filename: str) -> str:
-        """Save data to JSON file."""
+    async def save(
+        self,
+        data: list[dict[str, Any]] | ExportOutput,
+        filename: str,
+    ) -> str:
+        """
+        Save data to JSON file.
+
+        Args:
+            data: List of dicts or ExportOutput instance
+            filename: Output filename (with or without .json)
+
+        Returns:
+            Full path to saved file
+        """
         if not filename.endswith(".json"):
             filename = f"{filename}.json"
         path = self.output_dir / filename
+
+        # Convert ExportOutput to dict if needed
+        output_data = data.to_dict() if isinstance(data, ExportOutput) else data
+
         async with aiofiles.open(path, "w") as f:
-            await f.write(json.dumps(data, indent=2, ensure_ascii=False))
+            await f.write(json.dumps(output_data, indent=2, ensure_ascii=False))
         return str(path)
 
-    async def load(self, filename: str) -> list[dict[str, Any]]:
+    async def load(self, filename: str) -> dict[str, Any]:
         """Load data from JSON file."""
         path = self.output_dir / filename
         async with aiofiles.open(path) as f:
