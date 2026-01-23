@@ -26,6 +26,9 @@ COPY src ./src
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 
+# Fetch Camoufox browser
+RUN /app/.venv/bin/python -m camoufox fetch
+
 
 # Stage 2: Runtime
 FROM python:3.11-slim AS runtime
@@ -62,6 +65,9 @@ WORKDIR /app
 
 # Copy virtual environment from builder
 COPY --from=builder /app/.venv /app/.venv
+
+# Copy Camoufox browser from builder
+COPY --from=builder /root/.cache/camoufox /home/scraper/.cache/camoufox
 
 # Copy application code
 COPY src ./src

@@ -258,17 +258,19 @@ class SearchExtractor(BaseExtractor):
                 raw_products = []
 
         products = []
-        for raw in (raw_products or []):
+        for raw in raw_products or []:
             try:
-                products.append({
-                    "item_id": raw["item_id"],
-                    "shop_id": raw["shop_id"],
-                    "name": raw["name"],
-                    "price": parse_price(raw.get("price_text", "0")),
-                    "sold": parse_sold_count(raw.get("sold_text", "0")),
-                    "image": raw.get("image", ""),
-                    "url": f"{BASE_URL}{raw['href']}" if raw.get("href") else "",
-                })
+                products.append(
+                    {
+                        "item_id": raw["item_id"],
+                        "shop_id": raw["shop_id"],
+                        "name": raw["name"],
+                        "price": parse_price(raw.get("price_text", "0")),
+                        "sold": parse_sold_count(raw.get("sold_text", "0")),
+                        "image": raw.get("image", ""),
+                        "url": f"{BASE_URL}{raw['href']}" if raw.get("href") else "",
+                    }
+                )
             except Exception as e:
                 logger.warning(f"Failed to parse product: {e}")
 

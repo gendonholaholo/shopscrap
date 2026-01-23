@@ -253,7 +253,11 @@ class ReviewExtractor(BaseExtractor):
                 })()
             """)
 
-            summary = {"total_reviews": 0, "average_rating": 0.0, "rating_breakdown": {}}
+            summary = {
+                "total_reviews": 0,
+                "average_rating": 0.0,
+                "rating_breakdown": {},
+            }
             if isinstance(raw_summary, str):
                 with contextlib.suppress(json.JSONDecodeError):
                     summary = json.loads(raw_summary)

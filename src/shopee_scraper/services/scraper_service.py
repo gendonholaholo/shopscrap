@@ -5,9 +5,11 @@ from __future__ import annotations
 from typing import Any
 
 from shopee_scraper.core.scraper import ShopeeScraper
+from shopee_scraper.models.output import ProductOutput, _dataclass_to_dict
 from shopee_scraper.utils.health_checker import HealthChecker
 from shopee_scraper.utils.logging import get_logger
 from shopee_scraper.utils.system_monitor import get_uptime
+from shopee_scraper.utils.transformer import create_export
 
 
 logger = get_logger(__name__)
@@ -57,31 +59,31 @@ class ScraperService:
         keyword: str,
         max_pages: int = 1,
         sort_by: str = "relevancy",
+        max_reviews: int = 5,
         save: bool = False,
     ) -> dict[str, Any]:
         """
-        Search products by keyword.
+        Search products by keyword with full details.
 
         Returns:
-            Dict with products list and metadata
+            Dict with ExportOutput-compatible format
         """
         scraper = await self._get_scraper()
         logger.info(f"Service: searching for '{keyword}'")
 
-        products = await scraper.search(
+        # ShopeeScraper.search now returns list[ProductOutput]
+        products: list[ProductOutput] = await scraper.search(
             keyword=keyword,
             max_pages=max_pages,
             sort_by=sort_by,
+            max_reviews=max_reviews,
             save=save,
         )
 
-        return {
-            "keyword": keyword,
-            "total_count": len(products),
-            "page_count": max_pages,
-            "sort_by": sort_by,
-            "products": products,
-        }
+        # Create ExportOutput wrapper
+        export = create_export(products)
+
+        return _dataclass_to_dict(export)
 
     # =========================================================================
     # Product Operations
@@ -91,6 +93,7 @@ class ScraperService:
         self,
         shop_id: int,
         item_id: int,
+        max_reviews: int = 5,
         save: bool = False,
     ) -> dict[str, Any] | None:
         """Get product detail by shop_id and item_id."""
@@ -100,8 +103,16 @@ class ScraperService:
         product = await scraper.get_product(
             shop_id=shop_id,
             item_id=item_id,
+            max_reviews=max_reviews,
             save=save,
         )
+
+        if not product:
+            return None
+
+        # If it's a ProductOutput, convert to dict
+        if isinstance(product, ProductOutput):
+            return _dataclass_to_dict(product)
 
         return product
 
@@ -109,23 +120,36 @@ class ScraperService:
         self,
         keyword: str,
         max_products: int = 10,
+        max_reviews: int = 5,
         save: bool = False,
     ) -> dict[str, Any]:
-        """Search and get full details for products."""
-        scraper = await self._get_scraper()
-        logger.info(f"Service: batch get products for '{keyword}'")
+        """
+        Search and get full details for products.
 
-        products = await scraper.get_products_from_search(
+        This is a convenience method that limits the number of products
+        to fetch details for (useful for API with limits).
+        """
+        scraper = await self._get_scraper()
+        logger.info(
+            f"Service: batch get products for '{keyword}' (max: {max_products})"
+        )
+
+        # Use search which now fetches full details automatically
+        # We limit via search extractor results
+        products: list[ProductOutput] = await scraper.search(
             keyword=keyword,
-            max_products=max_products,
+            max_pages=1,  # Single page for batch
+            max_reviews=max_reviews,
             save=save,
         )
 
-        return {
-            "keyword": keyword,
-            "total_count": len(products),
-            "products": products,
-        }
+        # Limit to max_products
+        products = products[:max_products]
+
+        # Create ExportOutput wrapper
+        export = create_export(products)
+
+        return _dataclass_to_dict(export)
 
     # =========================================================================
     # Review Operations

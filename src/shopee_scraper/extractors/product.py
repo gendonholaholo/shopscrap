@@ -300,7 +300,11 @@ class ProductExtractor(BaseExtractor):
                 "url": f"{BASE_URL}/product/{shop_id}/{item_id}",
             }
 
-            logger.info("Product extracted via DOM", item_id=item_id, name=product["name"][:30] if product["name"] else "")
+            logger.info(
+                "Product extracted via DOM",
+                item_id=item_id,
+                name=product["name"][:30] if product["name"] else "",
+            )
             return product
 
         except Exception as e:

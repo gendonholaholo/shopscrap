@@ -156,16 +156,18 @@ class BrowserManager:
         result = await tab.send(net.get_all_cookies())
         cookies = []
         for c in result:
-            cookies.append({
-                "name": c.name,
-                "value": c.value,
-                "domain": c.domain,
-                "path": c.path,
-                "expires": c.expires,
-                "httpOnly": c.http_only,
-                "secure": c.secure,
-                "sameSite": c.same_site.value if c.same_site else "Lax",
-            })
+            cookies.append(
+                {
+                    "name": c.name,
+                    "value": c.value,
+                    "domain": c.domain,
+                    "path": c.path,
+                    "expires": c.expires,
+                    "httpOnly": c.http_only,
+                    "secure": c.secure,
+                    "sameSite": c.same_site.value if c.same_site else "Lax",
+                }
+            )
         return cookies
 
     async def set_cookies(self, cookies: list[dict[str, Any]]) -> None:
@@ -177,12 +179,14 @@ class BrowserManager:
 
         cookie_params = []
         for c in cookies:
-            cookie_params.append(net.CookieParam(
-                name=c["name"],
-                value=c["value"],
-                domain=c.get("domain", ".shopee.co.id"),
-                path=c.get("path", "/"),
-            ))
+            cookie_params.append(
+                net.CookieParam(
+                    name=c["name"],
+                    value=c["value"],
+                    domain=c.get("domain", ".shopee.co.id"),
+                    path=c.get("path", "/"),
+                )
+            )
 
         tab = self._browser.main_tab
         await tab.send(net.set_cookies(cookie_params))

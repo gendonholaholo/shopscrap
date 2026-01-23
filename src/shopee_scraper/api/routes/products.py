@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Path, status
+from fastapi import APIRouter, HTTPException, Path, Query, status
 from pydantic import BaseModel, Field
 
 from shopee_scraper.api.dependencies import RequireApiKey, ScraperServiceDep
@@ -33,7 +33,7 @@ class ScrapeListAndDetailsRequest(BaseModel):
 
     keyword: str = Field(..., min_length=1, max_length=200)
     max_products: int = Field(default=10, ge=1, le=100)
-    include_reviews: bool = Field(default=False)
+    include_reviews: bool = Field(default=True)
 
 
 class JobSubmitResponse(BaseModel):
@@ -68,7 +68,10 @@ async def scrape_list(
     """
     Scrape product list by keyword (async).
 
-    Returns basic product info: name, price, sold count, rating.
+    Returns full product details in ExportOutput format:
+    - exportedAt, marketplace, count
+    - products[] with full details including seller, reviews, variants
+
     Use GET /jobs/{job_id} to retrieve results when completed.
 
     - **keyword**: Search keyword (required)
@@ -115,12 +118,14 @@ async def scrape_list_and_details(
     """
     Scrape product list with full details (async).
 
-    Searches for products and fetches complete details for each:
-    images, variants, shop info, description, etc.
+    Returns ExportOutput format with complete product information:
+    - Full product details (images, variants, description)
+    - Seller information
+    - Reviews (if include_reviews=true)
 
     - **keyword**: Search keyword (required)
     - **max_products**: Maximum products to scrape (1-100, default: 10)
-    - **include_reviews**: Also fetch reviews for each product (default: false)
+    - **include_reviews**: Also fetch reviews for each product (default: true)
     """
     queue = get_job_queue()
 
@@ -152,9 +157,9 @@ async def scrape_list_and_details(
 @router.get(
     "/{shop_id}/{item_id}",
     summary="Get product detail",
-    description="Retrieve detailed information for a specific product.",
+    description="Retrieve detailed information for a specific product in ProductOutput format.",
     responses={
-        200: {"description": "Product details"},
+        200: {"description": "Product details in ProductOutput format"},
         404: {"model": ErrorResponse, "description": "Product not found"},
         500: {"model": ErrorResponse, "description": "Scraping error"},
     },
@@ -164,20 +169,25 @@ async def get_product(
     _api_key: RequireApiKey,
     shop_id: int = Path(..., description="Shop ID", gt=0),
     item_id: int = Path(..., description="Item ID", gt=0),
+    max_reviews: int = Query(
+        default=5, ge=0, le=50, description="Max reviews to fetch"
+    ),
 ) -> dict[str, Any]:
     """
     Get product detail by shop_id and item_id.
 
-    Returns full product information including:
-    - Basic info (name, price, stock)
-    - Images and variations
-    - Shop information
-    - Rating and reviews count
+    Returns ProductOutput format including:
+    - Basic info (id, title, price, stock)
+    - Images and variants
+    - Seller information
+    - Reviews summary and items
+    - Category and specifications
     """
     try:
         product = await service.get_product(
             shop_id=shop_id,
             item_id=item_id,
+            max_reviews=max_reviews,
         )
 
         if not product:

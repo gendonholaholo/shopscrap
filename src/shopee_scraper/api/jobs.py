@@ -292,11 +292,13 @@ async def setup_job_queue(scraper_service: Any) -> JobQueue:
         max_pages: int = 1,
         sort_by: str = "relevancy",
     ) -> dict[str, Any]:
-        """Handler for scrape list jobs."""
+        """Handler for scrape list jobs - returns ExportOutput format."""
+        # search_products now returns ExportOutput-compatible dict
         return await scraper_service.search_products(
             keyword=keyword,
             max_pages=max_pages,
             sort_by=sort_by,
+            max_reviews=5,  # Default reviews per product
         )
 
     async def scrape_list_and_details_handler(
@@ -304,26 +306,15 @@ async def setup_job_queue(scraper_service: Any) -> JobQueue:
         max_products: int = 10,
         include_reviews: bool = False,
     ) -> dict[str, Any]:
-        """Handler for scrape list and details jobs."""
-        result = await scraper_service.get_products_batch(
+        """Handler for scrape list and details jobs - returns ExportOutput format."""
+        # get_products_batch returns ExportOutput-compatible dict
+        # Reviews are already included via scraper.search()
+        max_reviews = 5 if include_reviews else 0
+        return await scraper_service.get_products_batch(
             keyword=keyword,
             max_products=max_products,
+            max_reviews=max_reviews,
         )
-
-        if include_reviews:
-            # Get reviews for each product
-            for product in result.get("products", []):
-                shop_id = product.get("shop_id")
-                item_id = product.get("item_id")
-                if shop_id and item_id:
-                    reviews = await scraper_service.get_reviews(
-                        shop_id=shop_id,
-                        item_id=item_id,
-                        max_reviews=20,
-                    )
-                    product["reviews"] = reviews.get("reviews", [])
-
-        return result
 
     queue.register_handler("scrape_list", scrape_list_handler)
     queue.register_handler("scrape_list_and_details", scrape_list_and_details_handler)

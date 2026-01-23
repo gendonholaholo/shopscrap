@@ -263,7 +263,10 @@ class SessionManager:
 
             # Check if already logged in (redirected with is_logged_in=true)
             current_url = self._get_url(page)
-            if "is_logged_in=true" in current_url or "is_from_login=true" in current_url:
+            if (
+                "is_logged_in=true" in current_url
+                or "is_from_login=true" in current_url
+            ):
                 logger.info("Already logged in (detected from redirect URL)")
                 cookies = await browser.get_cookies()
                 self.save_cookies(cookies, session_name)
@@ -280,15 +283,16 @@ class SessionManager:
             if not form_found:
                 # Re-check URL - page may have redirected during the wait
                 current_url = self._get_url(page)
-                if "is_logged_in=true" in current_url or "is_from_login=true" in current_url:
+                if (
+                    "is_logged_in=true" in current_url
+                    or "is_from_login=true" in current_url
+                ):
                     logger.info("Already logged in (detected after form wait)")
                     cookies = await browser.get_cookies()
                     self.save_cookies(cookies, session_name)
                     self._is_logged_in = True
                     return True
-                logger.error(
-                    "Login form not found", current_url=current_url
-                )
+                logger.error("Login form not found", current_url=current_url)
                 return False
 
             # Fill username
@@ -336,9 +340,8 @@ class SessionManager:
             # But skip waiting if is_logged_in=true (login already succeeded)
             current_url = self._get_url(page)
             if (
-                ("/buyer/login" in current_url or "/verify/" in current_url)
-                and "is_logged_in=true" not in current_url
-            ):
+                "/buyer/login" in current_url or "/verify/" in current_url
+            ) and "is_logged_in=true" not in current_url:
                 logger.warning(
                     "Still on login/verification page - waiting for manual completion (90s)"
                 )
@@ -418,7 +421,10 @@ class SessionManager:
             logger.info("Verifying login", current_url=current_url)
 
             # Quick check: URL indicators of successful login
-            if "is_from_login=true" in current_url or "is_logged_in=true" in current_url:
+            if (
+                "is_from_login=true" in current_url
+                or "is_logged_in=true" in current_url
+            ):
                 logger.info("Login success detected from URL", current_url=current_url)
                 return True
 
@@ -426,7 +432,8 @@ class SessionManager:
             if "/buyer/login" not in current_url and "/verify/" not in current_url:
                 cookies = await browser.get_cookies()
                 shopee_auth_cookies = [
-                    c for c in cookies
+                    c
+                    for c in cookies
                     if c.get("name") in ("SPC_EC", "SPC_ST", "SPC_CDS")
                 ]
                 if shopee_auth_cookies:
