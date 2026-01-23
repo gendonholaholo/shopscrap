@@ -1,0 +1,163 @@
+syntax = "proto3";
+
+package shopee;
+
+option python_package = "shopee_scraper.grpc";
+
+// =============================================================================
+// Shopee Scraper gRPC Service
+// =============================================================================
+
+service ShopeeScraperService {
+  // Search products by keyword
+  rpc SearchProducts(SearchRequest) returns (SearchResponse);
+  
+  // Get single product detail
+  rpc GetProduct(ProductRequest) returns (ProductResponse);
+  
+  // Get product reviews
+  rpc GetReviews(ReviewsRequest) returns (ReviewsResponse);
+  
+  // Get review summary
+  rpc GetReviewSummary(ReviewsRequest) returns (ReviewSummaryResponse);
+  
+  // Stream search results (for large datasets)
+  rpc SearchProductsStream(SearchRequest) returns (stream Product);
+  
+  // Health check
+  rpc HealthCheck(HealthRequest) returns (HealthResponse);
+}
+
+// =============================================================================
+// Common Messages
+// =============================================================================
+
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1;
+  string version = 2;
+  bool scraper_ready = 3;
+}
+
+// =============================================================================
+// Search Messages
+// =============================================================================
+
+enum SortOrder {
+  SORT_RELEVANCY = 0;
+  SORT_SALES = 1;
+  SORT_PRICE_ASC = 2;
+  SORT_PRICE_DESC = 3;
+}
+
+message SearchRequest {
+  string keyword = 1;
+  int32 max_pages = 2;
+  SortOrder sort_by = 3;
+  bool save = 4;
+}
+
+message SearchResponse {
+  bool success = 1;
+  string message = 2;
+  SearchMeta meta = 3;
+  repeated Product products = 4;
+}
+
+message SearchMeta {
+  string keyword = 1;
+  int32 total_count = 2;
+  int32 page_count = 3;
+  string sort_by = 4;
+}
+
+// =============================================================================
+// Product Messages
+// =============================================================================
+
+message ProductRequest {
+  int64 shop_id = 1;
+  int64 item_id = 2;
+  bool save = 3;
+}
+
+message ProductResponse {
+  bool success = 1;
+  string message = 2;
+  Product product = 3;
+}
+
+message Product {
+  int64 item_id = 1;
+  int64 shop_id = 2;
+  string name = 3;
+  double price = 4;
+  double original_price = 5;
+  double discount = 6;
+  int32 sold = 7;
+  int32 stock = 8;
+  double rating = 9;
+  int32 rating_count = 10;
+  string image_url = 11;
+  string shop_name = 12;
+  string location = 13;
+  string description = 14;
+  repeated string categories = 15;
+  repeated string images = 16;
+  repeated Variation variations = 17;
+}
+
+message Variation {
+  string name = 1;
+  repeated string options = 2;
+  double price = 3;
+  int32 stock = 4;
+}
+
+// =============================================================================
+// Review Messages
+// =============================================================================
+
+message ReviewsRequest {
+  int64 shop_id = 1;
+  int64 item_id = 2;
+  int32 max_reviews = 3;
+  bool save = 4;
+}
+
+message ReviewsResponse {
+  bool success = 1;
+  string message = 2;
+  ReviewsMeta meta = 3;
+  repeated Review reviews = 4;
+}
+
+message ReviewsMeta {
+  int64 shop_id = 1;
+  int64 item_id = 2;
+  int32 total_count = 3;
+  double average_rating = 4;
+}
+
+message Review {
+  int32 rating = 1;
+  string comment = 2;
+  ReviewAuthor author = 3;
+  string created_at = 4;
+  repeated string images = 5;
+  int32 likes = 6;
+}
+
+message ReviewAuthor {
+  int64 user_id = 1;
+  string username = 2;
+  string avatar = 3;
+}
+
+message ReviewSummaryResponse {
+  bool success = 1;
+  int32 total_reviews = 2;
+  double average_rating = 3;
+  map<string, int32> rating_distribution = 4;
+}

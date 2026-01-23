@@ -1,0 +1,54 @@
+# ============================================================================
+# Shopee Scraper - Development Dockerfile
+# ============================================================================
+
+FROM python:3.11-slim
+
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Firefox dependencies
+    libgtk-3-0 \
+    libdbus-glib-1-2 \
+    libxt6 \
+    libasound2 \
+    libx11-xcb1 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxrandr2 \
+    libxss1 \
+    libxcursor1 \
+    libxfixes3 \
+    libpango-1.0-0 \
+    libcairo2 \
+    # Virtual display
+    xvfb \
+    # Dev tools
+    git \
+    curl \
+    vim \
+    ca-certificates \
+    fonts-liberation \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Environment variables
+ENV UV_COMPILE_BYTECODE=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    DISPLAY=:99
+
+# Install all dependencies including dev
+COPY pyproject.toml uv.lock* ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-install-project
+
+# Source will be mounted as volume
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONPATH="/app/src"
+
+# Keep container running
+CMD ["tail", "-f", "/dev/null"]

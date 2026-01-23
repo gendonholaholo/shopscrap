@@ -1,0 +1,160 @@
+version: "3.9"
+
+services:
+  # ==========================================================================
+  # REST API Service (Production)
+  # ==========================================================================
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: shopee-api
+    restart: unless-stopped
+    command: ["uvicorn", "shopee_scraper.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      - DISPLAY=:99
+      - SHOPEE_ENV=production
+      # Rate Limiting
+      - RATE_LIMIT_ENABLED=true
+      - RATE_LIMIT_REQUESTS_PER_MINUTE=60
+      - RATE_LIMIT_STORAGE=redis
+      - RATE_LIMIT_REDIS_URL=redis://redis:6379
+      # CORS
+      - CORS_ENABLED=true
+      - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-*}
+      # Auth (set API_KEYS in .env file)
+      - API_AUTH_ENABLED=${API_AUTH_ENABLED:-false}
+      - API_KEYS=${API_KEYS:-}
+    volumes:
+      - ./data/output:/app/data/output
+      - ./data/sessions:/app/data/sessions
+      - ./logs:/app/logs
+      - ./config:/app/config:ro
+    ports:
+      - "${API_PORT:-8000}:8000"
+    networks:
+      - scraper-network
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health/live"]
+      interval: 30s
+      timeout: 10s
+      start_period: 40s
+      retries: 3
+
+  # ==========================================================================
+  # CLI Scraper Service (One-off tasks)
+  # ==========================================================================
+  scraper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: shopee-scraper
+    environment:
+      - DISPLAY=:99
+      - SHOPEE_ENV=production
+    volumes:
+      - ./data/output:/app/data/output
+      - ./data/sessions:/app/data/sessions
+      - ./logs:/app/logs
+      - ./config:/app/config:ro
+    networks:
+      - scraper-network
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
+    # Run one-off commands: docker-compose run scraper search "laptop"
+
+  # ==========================================================================
+  # Development Environment
+  # ==========================================================================
+  dev:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dev
+    container_name: shopee-scraper-dev
+    environment:
+      - DISPLAY=:99
+      - SHOPEE_ENV=development
+      - RATE_LIMIT_ENABLED=false
+      - API_AUTH_ENABLED=false
+    volumes:
+      - .:/app
+      - dev-venv:/app/.venv
+    ports:
+      - "8001:8000"  # Dev API on different port
+    networks:
+      - scraper-network
+    stdin_open: true
+    tty: true
+
+  # ==========================================================================
+  # Redis (Rate Limiting & Caching)
+  # ==========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: shopee-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    networks:
+      - scraper-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ==========================================================================
+  # Database (Optional - for persistent storage)
+  # ==========================================================================
+  db:
+    image: postgres:16-alpine
+    container_name: shopee-db
+    restart: unless-stopped
+    profiles:
+      - with-db  # Only start with: docker-compose --profile with-db up
+    environment:
+      POSTGRES_USER: ${DB_USER:-shopee}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-shopee_secret}
+      POSTGRES_DB: ${DB_NAME:-shopee_data}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    networks:
+      - scraper-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-shopee}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+# ==========================================================================
+# Networks
+# ==========================================================================
+networks:
+  scraper-network:
+    driver: bridge
+
+# ==========================================================================
+# Volumes
+# ==========================================================================
+volumes:
+  postgres-data:
+  redis-data:
+  dev-venv:

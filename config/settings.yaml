@@ -1,0 +1,31 @@
+# ============================================================================
+# Shopee Scraper - Default Configuration
+# ============================================================================
+
+scraper:
+  name: "shopee-scraper"
+  version: "0.1.0"
+  base_url: "https://shopee.co.id"
+
+browser:
+  headless: true
+  timeout: 30000
+  viewport:
+    width: 1920
+    height: 1080
+
+anti_detection:
+  rotate_fingerprint: true
+  rotate_user_agent: true
+  human_like_delays: true
+  min_delay: 1.0
+  max_delay: 3.0
+
+rate_limit:
+  requests_per_minute: 60
+  burst_limit: 10
+  backoff_factor: 2.0
+
+retry:
+  max_attempts: 3
+  base_delay: 5.0
