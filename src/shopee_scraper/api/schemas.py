@@ -7,6 +7,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from shopee_scraper.api.jobs import JobStatus
+
 
 # =============================================================================
 # Enums
@@ -20,15 +22,6 @@ class SortOrder(str, Enum):
     SALES = "sales"
     PRICE_ASC = "price_asc"
     PRICE_DESC = "price_desc"
-
-
-class JobStatus(str, Enum):
-    """Async job status."""
-
-    PENDING = "pending"
-    PROCESSING = "processing"
-    COMPLETED = "completed"
-    FAILED = "failed"
 
 
 # =============================================================================

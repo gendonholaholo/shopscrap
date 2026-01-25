@@ -138,6 +138,49 @@ class AuthSettings(BaseSettings):
         return [k.strip() for k in self.keys.split(",") if k.strip()]
 
 
+class JobQueueSettings(BaseSettings):
+    """Job queue configuration (Redis-backed)."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="JOB_QUEUE_",
+        env_file=".env",
+        extra="ignore",
+    )
+
+    redis_url: str = Field(
+        default="redis://localhost:6379/1",
+        description="Redis URL for job queue (DB 1, separate from rate limiter)",
+    )
+    max_concurrent: int = Field(
+        default=3,
+        description="Maximum concurrent job workers",
+    )
+    job_ttl_hours: int = Field(
+        default=24,
+        description="TTL for completed/failed jobs in hours",
+    )
+    max_retries: int = Field(
+        default=3,
+        description="Maximum retry attempts for failed jobs",
+    )
+    retry_delay_seconds: int = Field(
+        default=5,
+        description="Base delay between retries (exponential backoff)",
+    )
+    handler_timeout_seconds: int = Field(
+        default=3600,
+        description="Maximum execution time per job handler (1 hour)",
+    )
+    max_queue_size: int = Field(
+        default=100,
+        description="Maximum pending jobs in queue (rejects when full)",
+    )
+    cleanup_interval_seconds: int = Field(
+        default=3600,
+        description="Interval between cleanup cycles",
+    )
+
+
 class CaptchaSettings(BaseSettings):
     """CAPTCHA solver configuration."""
 
@@ -169,6 +212,7 @@ class Settings(BaseSettings):
     rate_limit: RateLimitSettings = Field(default_factory=RateLimitSettings)
     cors: CORSSettings = Field(default_factory=CORSSettings)
     auth: AuthSettings = Field(default_factory=AuthSettings)
+    job_queue: JobQueueSettings = Field(default_factory=JobQueueSettings)
     captcha: CaptchaSettings = Field(default_factory=CaptchaSettings)
     output_dir: Path = Path("./data/output")
     log_level: str = "INFO"

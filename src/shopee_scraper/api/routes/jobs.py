@@ -46,7 +46,7 @@ async def list_jobs(
                 detail=f"Invalid status: {status_filter}",
             ) from None
 
-    jobs = queue.list_jobs(status=job_status, limit=limit)
+    jobs = await queue.list_jobs(status=job_status, limit=limit)
 
     return {
         "success": True,
@@ -73,7 +73,7 @@ async def get_job(
 ) -> dict[str, Any]:
     """Get job by ID with full details."""
     queue = get_job_queue()
-    job = queue.get_job(job_id)
+    job = await queue.get_job(job_id)
 
     if not job:
         raise HTTPException(
@@ -102,7 +102,7 @@ async def get_job_status(
 ) -> dict[str, Any]:
     """Get job status only (for polling)."""
     queue = get_job_queue()
-    job = queue.get_job(job_id)
+    job = await queue.get_job(job_id)
 
     if not job:
         raise HTTPException(
@@ -130,9 +130,9 @@ async def cancel_job(
     _api_key: RequireApiKey,
     job_id: str = Path(..., description="Job ID"),
 ) -> dict[str, Any]:
-    """Cancel a pending job."""
+    """Cancel a pending or running job."""
     queue = get_job_queue()
-    job = queue.get_job(job_id)
+    job = await queue.get_job(job_id)
 
     if not job:
         raise HTTPException(
@@ -140,7 +140,7 @@ async def cancel_job(
             detail=f"Job not found: {job_id}",
         )
 
-    if not queue.cancel_job(job_id):
+    if not await queue.cancel_job(job_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot cancel job in {job.status.value} status",

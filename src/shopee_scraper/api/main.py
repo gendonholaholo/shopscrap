@@ -10,7 +10,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from shopee_scraper import __version__
-from shopee_scraper.api.dependencies import cleanup_scraper_service, get_scraper_service
+from shopee_scraper.api.dependencies import (
+    cleanup_redis,
+    cleanup_scraper_service,
+    get_redis,
+    get_scraper_service,
+)
 from shopee_scraper.api.jobs import cleanup_job_queue, setup_job_queue
 from shopee_scraper.api.rate_limiter import setup_rate_limiter
 from shopee_scraper.api.routes import (
@@ -41,11 +46,16 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         debug=settings.debug,
     )
 
-    # Startup: Initialize job queue
+    # Startup: Initialize Redis and job queue
     try:
+        redis = await get_redis()
         scraper_service = await get_scraper_service()
-        await setup_job_queue(scraper_service)
-        logger.info("Job queue initialized")
+        await setup_job_queue(
+            redis=redis,
+            settings=settings.job_queue,
+            scraper_service=scraper_service,
+        )
+        logger.info("Job queue initialized with Redis backend")
     except Exception as e:
         logger.warning(f"Failed to initialize job queue: {e}")
 
@@ -54,6 +64,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # Shutdown
     logger.info("Shutting down Shopee Scraper API")
     await cleanup_job_queue()
+    await cleanup_redis()
     await cleanup_scraper_service()
 
 

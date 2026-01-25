@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Path, Query, status
 from pydantic import BaseModel, Field
 
 from shopee_scraper.api.dependencies import RequireApiKey, ScraperServiceDep
-from shopee_scraper.api.jobs import get_job_queue
+from shopee_scraper.api.jobs import QueueFullError, get_job_queue
 from shopee_scraper.api.schemas import ErrorResponse, ProductLinks, SortOrder
 
 
@@ -80,14 +80,20 @@ async def scrape_list(
     """
     queue = get_job_queue()
 
-    job = await queue.submit(
-        job_type="scrape_list",
-        params={
-            "keyword": request.keyword,
-            "max_pages": request.max_pages,
-            "sort_by": request.sort_by.value,
-        },
-    )
+    try:
+        job = await queue.submit(
+            job_type="scrape_list",
+            params={
+                "keyword": request.keyword,
+                "max_pages": request.max_pages,
+                "sort_by": request.sort_by.value,
+            },
+        )
+    except QueueFullError as e:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=str(e),
+        ) from e
 
     return JobSubmitResponse(
         success=True,
@@ -129,14 +135,20 @@ async def scrape_list_and_details(
     """
     queue = get_job_queue()
 
-    job = await queue.submit(
-        job_type="scrape_list_and_details",
-        params={
-            "keyword": request.keyword,
-            "max_products": request.max_products,
-            "include_reviews": request.include_reviews,
-        },
-    )
+    try:
+        job = await queue.submit(
+            job_type="scrape_list_and_details",
+            params={
+                "keyword": request.keyword,
+                "max_products": request.max_products,
+                "include_reviews": request.include_reviews,
+            },
+        )
+    except QueueFullError as e:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=str(e),
+        ) from e
 
     return JobSubmitResponse(
         success=True,

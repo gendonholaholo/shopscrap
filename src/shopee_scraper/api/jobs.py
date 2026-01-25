@@ -1,19 +1,24 @@
-"""Background job queue for long-running scrape tasks."""
+"""Redis-backed background job queue for long-running scrape tasks."""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
+from shopee_scraper.utils.config import JobQueueSettings
 from shopee_scraper.utils.logging import get_logger
 
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
+
+    from redis.asyncio import Redis
 
 logger = get_logger(__name__)
 
@@ -36,15 +41,16 @@ class Job:
     type: str
     params: dict[str, Any]
     status: JobStatus = JobStatus.PENDING
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     started_at: datetime | None = None
     completed_at: datetime | None = None
     result: dict[str, Any] | None = None
     error: str | None = None
     progress: int = 0  # 0-100
+    retries: int = 0
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert job to dictionary."""
+        """Convert job to dictionary for API responses."""
         return {
             "id": self.id,
             "type": self.type,
@@ -52,37 +58,80 @@ class Job:
             "params": self.params,
             "created_at": self.created_at.isoformat(),
             "started_at": self.started_at.isoformat() if self.started_at else None,
-            "completed_at": self.completed_at.isoformat()
-            if self.completed_at
-            else None,
+            "completed_at": (
+                self.completed_at.isoformat() if self.completed_at else None
+            ),
             "progress": self.progress,
             "result": self.result,
             "error": self.error,
+            "retries": self.retries,
         }
 
+    def to_json(self) -> str:
+        """Serialize job to JSON string for Redis storage."""
+        return json.dumps(self.to_dict())
 
-class JobQueue:
+    @classmethod
+    def from_json(cls, data: str) -> Job:
+        """Deserialize job from JSON string."""
+        d = json.loads(data)
+        return cls(
+            id=d["id"],
+            type=d["type"],
+            params=d["params"],
+            status=JobStatus(d["status"]),
+            created_at=datetime.fromisoformat(d["created_at"]),
+            started_at=(
+                datetime.fromisoformat(d["started_at"]) if d.get("started_at") else None
+            ),
+            completed_at=(
+                datetime.fromisoformat(d["completed_at"])
+                if d.get("completed_at")
+                else None
+            ),
+            result=d.get("result"),
+            error=d.get("error"),
+            progress=d.get("progress", 0),
+            retries=d.get("retries", 0),
+        )
+
+
+# Redis key schema
+_KEY_JOB = "job:{job_id}"  # String (JSON-serialized Job)
+_KEY_QUEUE_PENDING = "job_queue:pending"  # List (job IDs, LPUSH/BRPOP)
+_KEY_STATUS_SET = "jobs:status:{status}"  # Set (job IDs by status)
+_KEY_ALL_JOBS = "jobs:all"  # Set (all job IDs)
+_KEY_META = "job_queue:meta"  # Hash (queue stats)
+
+
+class QueueFullError(Exception):
+    """Raised when queue is at max capacity."""
+
+
+class RedisJobQueue:
     """
-    Simple in-memory job queue for background tasks.
+    Redis-backed job queue with async workers.
 
-    For production, consider using Celery with Redis/RabbitMQ.
+    Features:
+    - Persistent job storage via Redis
+    - Bounded queue with configurable max size
+    - Retry with exponential backoff
+    - Handler timeout enforcement
+    - Graceful shutdown with job recovery on restart
+    - Periodic cleanup of expired jobs
+    - Progress tracking
     """
 
-    def __init__(self, max_concurrent: int = 3) -> None:
-        """
-        Initialize job queue.
-
-        Args:
-            max_concurrent: Maximum concurrent jobs
-        """
-        self.max_concurrent = max_concurrent
-        self._jobs: dict[str, Job] = {}
-        self._queue: asyncio.Queue[str] = asyncio.Queue()
+    def __init__(self, redis: Redis, settings: JobQueueSettings) -> None:
+        self._redis = redis
+        self._settings = settings
         self._handlers: dict[
             str, Callable[..., Coroutine[Any, Any, dict[str, Any]]]
         ] = {}
         self._workers: list[asyncio.Task[None]] = []
         self._running = False
+        self._cleanup_task: asyncio.Task[None] | None = None
+        self._active_tasks: dict[str, asyncio.Task[Any]] = {}  # job_id -> task
 
     def register_handler(
         self,
@@ -94,30 +143,53 @@ class JobQueue:
         logger.info(f"Registered job handler: {job_type}")
 
     async def start(self) -> None:
-        """Start the job queue workers."""
+        """Start workers, cleanup task, and recover interrupted jobs."""
         if self._running:
             return
 
         self._running = True
-        for i in range(self.max_concurrent):
+
+        # Recover jobs that were RUNNING when server crashed
+        await self._recover_interrupted_jobs()
+
+        # Start worker tasks
+        for i in range(self._settings.max_concurrent):
             worker = asyncio.create_task(self._worker(i))
             self._workers.append(worker)
 
-        logger.info(f"Job queue started with {self.max_concurrent} workers")
+        # Start cleanup worker
+        self._cleanup_task = asyncio.create_task(self._cleanup_worker())
+
+        logger.info(f"Job queue started with {self._settings.max_concurrent} workers")
 
     async def stop(self) -> None:
-        """Stop the job queue workers."""
+        """Graceful shutdown: cancel workers, save running job state."""
         self._running = False
 
-        # Cancel all workers
+        # Cancel active job tasks
+        for job_id, task in list(self._active_tasks.items()):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+            # Requeue the job so it can be picked up on restart
+            await self._requeue_job(job_id)
+
+        self._active_tasks.clear()
+
+        # Cancel workers
         for worker in self._workers:
             worker.cancel()
-
-        # Wait for workers to finish
         if self._workers:
             await asyncio.gather(*self._workers, return_exceptions=True)
-
         self._workers.clear()
+
+        # Cancel cleanup task
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._cleanup_task
+            self._cleanup_task = None
+
         logger.info("Job queue stopped")
 
     async def submit(
@@ -128,163 +200,337 @@ class JobQueue:
         """
         Submit a new job to the queue.
 
-        Args:
-            job_type: Type of job (must have registered handler)
-            params: Job parameters
-
-        Returns:
-            Created job
+        Raises:
+            ValueError: If job_type has no registered handler
+            QueueFullError: If queue is at max capacity
         """
         if job_type not in self._handlers:
             raise ValueError(f"Unknown job type: {job_type}")
 
+        # Check queue size
+        queue_size = await self._redis.llen(_KEY_QUEUE_PENDING)
+        if queue_size >= self._settings.max_queue_size:
+            raise QueueFullError(
+                f"Queue is full ({queue_size}/{self._settings.max_queue_size})"
+            )
+
         job_id = str(uuid.uuid4())
-        job = Job(
-            id=job_id,
-            type=job_type,
-            params=params,
+        job = Job(id=job_id, type=job_type, params=params)
+
+        # Persist job to Redis
+        await self._save_job(job)
+
+        # Add to pending queue
+        await self._redis.lpush(_KEY_QUEUE_PENDING, job_id)
+
+        # Track in sets
+        await self._redis.sadd(_KEY_ALL_JOBS, job_id)
+        await self._redis.sadd(
+            _KEY_STATUS_SET.format(status=JobStatus.PENDING.value), job_id
         )
 
-        self._jobs[job_id] = job
-        await self._queue.put(job_id)
+        # Update meta stats
+        await self._redis.hincrby(_KEY_META, "total_submitted", 1)
 
         logger.info(f"Job submitted: {job_id} ({job_type})")
         return job
 
-    def get_job(self, job_id: str) -> Job | None:
-        """Get job by ID."""
-        return self._jobs.get(job_id)
+    async def get_job(self, job_id: str) -> Job | None:
+        """Fetch job from Redis."""
+        data = await self._redis.get(_KEY_JOB.format(job_id=job_id))
+        if data is None:
+            return None
+        return Job.from_json(data)
 
-    def list_jobs(
+    async def list_jobs(
         self,
         status: JobStatus | None = None,
-        limit: int = 100,
+        limit: int = 50,
     ) -> list[Job]:
         """List jobs, optionally filtered by status."""
-        jobs = list(self._jobs.values())
-
         if status:
-            jobs = [j for j in jobs if j.status == status]
+            # Get job IDs from status set
+            job_ids = await self._redis.smembers(
+                _KEY_STATUS_SET.format(status=status.value)
+            )
+        else:
+            # Get all job IDs
+            job_ids = await self._redis.smembers(_KEY_ALL_JOBS)
+
+        # Fetch job data (pipeline for efficiency)
+        jobs: list[Job] = []
+        if job_ids:
+            pipe = self._redis.pipeline()
+            for job_id in job_ids:
+                pipe.get(_KEY_JOB.format(job_id=job_id))
+            results = await pipe.execute()
+
+            for data in results:
+                if data:
+                    jobs.append(Job.from_json(data))
 
         # Sort by created_at descending
         jobs.sort(key=lambda j: j.created_at, reverse=True)
-
         return jobs[:limit]
 
-    def cancel_job(self, job_id: str) -> bool:
-        """Cancel a pending job."""
-        job = self._jobs.get(job_id)
+    async def cancel_job(self, job_id: str) -> bool:
+        """Cancel a PENDING or RUNNING job."""
+        job = await self.get_job(job_id)
         if not job:
             return False
 
         if job.status == JobStatus.PENDING:
-            job.status = JobStatus.CANCELLED
-            job.completed_at = datetime.utcnow()
-            logger.info(f"Job cancelled: {job_id}")
+            # Remove from pending queue (best-effort, LREM)
+            await self._redis.lrem(_KEY_QUEUE_PENDING, 0, job_id)
+            await self._transition_status(job, JobStatus.CANCELLED)
+            job.completed_at = datetime.now(timezone.utc)
+            await self._save_job(job)
+            logger.info(f"Job cancelled (was pending): {job_id}")
+            return True
+
+        if job.status == JobStatus.RUNNING:
+            # Cancel the active task if we have it
+            task = self._active_tasks.get(job_id)
+            if task:
+                task.cancel()
+            await self._transition_status(job, JobStatus.CANCELLED)
+            job.completed_at = datetime.now(timezone.utc)
+            await self._save_job(job)
+            logger.info(f"Job cancelled (was running): {job_id}")
             return True
 
         return False
 
-    def cleanup_old_jobs(self, max_age_hours: int = 24) -> int:
-        """Remove old completed/failed jobs."""
-        cutoff = datetime.utcnow()
-        removed = 0
+    async def update_progress(self, job_id: str, progress: int) -> None:
+        """Update job progress (0-100)."""
+        job = await self.get_job(job_id)
+        if job and job.status == JobStatus.RUNNING:
+            job.progress = min(max(progress, 0), 100)
+            await self._save_job(job)
 
-        for job_id, job in list(self._jobs.items()):
-            is_finished = job.status in (
-                JobStatus.COMPLETED,
-                JobStatus.FAILED,
-                JobStatus.CANCELLED,
-            )
-            if is_finished and job.completed_at:
-                age = (cutoff - job.completed_at).total_seconds() / 3600
-                if age > max_age_hours:
-                    del self._jobs[job_id]
-                    removed += 1
+    # -------------------------------------------------------------------------
+    # Internal methods
+    # -------------------------------------------------------------------------
 
-        if removed:
-            logger.info(f"Cleaned up {removed} old jobs")
+    async def _save_job(self, job: Job) -> None:
+        """Persist job to Redis with TTL for completed jobs."""
+        key = _KEY_JOB.format(job_id=job.id)
+        await self._redis.set(key, job.to_json())
 
-        return removed
+        # Set TTL on completed/failed/cancelled jobs
+        if job.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
+            ttl_seconds = self._settings.job_ttl_hours * 3600
+            await self._redis.expire(key, ttl_seconds)
+
+    async def _transition_status(self, job: Job, new_status: JobStatus) -> None:
+        """Move job between status sets."""
+        old_status = job.status
+        # Remove from old status set
+        await self._redis.srem(_KEY_STATUS_SET.format(status=old_status.value), job.id)
+        # Add to new status set
+        await self._redis.sadd(_KEY_STATUS_SET.format(status=new_status.value), job.id)
+        job.status = new_status
+
+    async def _requeue_job(self, job_id: str) -> None:
+        """Requeue a job back to pending state."""
+        job = await self.get_job(job_id)
+        if job:
+            await self._transition_status(job, JobStatus.PENDING)
+            job.started_at = None
+            job.progress = 0
+            await self._save_job(job)
+            await self._redis.lpush(_KEY_QUEUE_PENDING, job_id)
+            logger.info(f"Job requeued: {job_id}")
+
+    async def _recover_interrupted_jobs(self) -> None:
+        """On startup: requeue jobs that were RUNNING (server crashed)."""
+        running_ids = await self._redis.smembers(
+            _KEY_STATUS_SET.format(status=JobStatus.RUNNING.value)
+        )
+        for job_id in running_ids:
+            await self._requeue_job(job_id)
+
+        if running_ids:
+            logger.info(f"Recovered {len(running_ids)} interrupted jobs")
 
     async def _worker(self, worker_id: int) -> None:
-        """Worker coroutine that processes jobs."""
+        """Worker loop: BRPOP from queue, process with timeout and retry."""
         logger.debug(f"Worker {worker_id} started")
 
         while self._running:
             try:
-                # Wait for a job with timeout
-                try:
-                    job_id = await asyncio.wait_for(
-                        self._queue.get(),
-                        timeout=1.0,
-                    )
-                except asyncio.TimeoutError:
+                # BRPOP with 1-second timeout to check _running flag
+                result = await self._redis.brpop(_KEY_QUEUE_PENDING, timeout=1)
+                if result is None:
                     continue
 
-                job = self._jobs.get(job_id)
+                _, job_id = result
+                # job_id may be bytes if decode_responses is off, but we use decode_responses=True
+                if isinstance(job_id, bytes):
+                    job_id = job_id.decode()
+
+                job = await self.get_job(job_id)
                 if not job or job.status != JobStatus.PENDING:
                     continue
 
-                # Process the job
                 await self._process_job(job, worker_id)
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Worker {worker_id} error: {e}")
+                await asyncio.sleep(1)
 
         logger.debug(f"Worker {worker_id} stopped")
 
     async def _process_job(self, job: Job, worker_id: int) -> None:
-        """Process a single job."""
+        """Execute handler with timeout, retry on failure."""
         logger.info(f"Worker {worker_id} processing job: {job.id}")
 
-        job.status = JobStatus.RUNNING
-        job.started_at = datetime.utcnow()
+        await self._transition_status(job, JobStatus.RUNNING)
+        job.started_at = datetime.now(timezone.utc)
+        await self._save_job(job)
+
+        handler = self._handlers.get(job.type)
+        if not handler:
+            job.error = f"No handler for job type: {job.type}"
+            await self._transition_status(job, JobStatus.FAILED)
+            job.completed_at = datetime.now(timezone.utc)
+            await self._save_job(job)
+            return
 
         try:
-            handler = self._handlers[job.type]
-            result = await handler(**job.params)
-
-            job.status = JobStatus.COMPLETED
-            job.result = result
-            job.progress = 100
-
-            logger.info(f"Job completed: {job.id}")
-
+            result = await self._execute_handler(job, handler)
+            await self._mark_completed(job, result)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            job.status = JobStatus.FAILED
-            job.error = str(e)
-            logger.error(f"Job failed: {job.id} - {e}")
-
+            await self._handle_failure(job, e)
         finally:
-            job.completed_at = datetime.utcnow()
+            self._active_tasks.pop(job.id, None)
+
+    async def _execute_handler(
+        self,
+        job: Job,
+        handler: Callable[..., Coroutine[Any, Any, dict[str, Any]]],
+    ) -> dict[str, Any]:
+        """Execute handler with timeout, raising on failure."""
+        task = asyncio.ensure_future(handler(**job.params))
+        self._active_tasks[job.id] = task
+
+        try:
+            return await asyncio.wait_for(
+                task, timeout=self._settings.handler_timeout_seconds
+            )
+        except asyncio.TimeoutError as exc:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+            raise TimeoutError(
+                f"Job exceeded timeout of {self._settings.handler_timeout_seconds}s"
+            ) from exc
+
+    async def _mark_completed(self, job: Job, result: dict[str, Any]) -> None:
+        """Mark job as successfully completed."""
+        await self._transition_status(job, JobStatus.COMPLETED)
+        job.result = result
+        job.progress = 100
+        job.completed_at = datetime.now(timezone.utc)
+        await self._save_job(job)
+        await self._redis.hincrby(_KEY_META, "total_completed", 1)
+        logger.info(f"Job completed: {job.id}")
+
+    async def _handle_failure(self, job: Job, error: Exception) -> None:
+        """Handle job failure with retry logic."""
+        job.retries += 1
+        error_msg = str(error)
+
+        if job.retries < self._settings.max_retries:
+            delay = self._settings.retry_delay_seconds * (2 ** (job.retries - 1))
+            logger.warning(
+                f"Job {job.id} failed (attempt {job.retries}/{self._settings.max_retries}), "
+                f"retrying in {delay}s: {error_msg}"
+            )
+            job.error = f"Retry {job.retries}: {error_msg}"
+            await self._save_job(job)
+
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+            # Requeue for retry
+            await self._transition_status(job, JobStatus.PENDING)
+            job.started_at = None
+            await self._save_job(job)
+            await self._redis.lpush(_KEY_QUEUE_PENDING, job.id)
+        else:
+            await self._transition_status(job, JobStatus.FAILED)
+            job.error = f"Failed after {job.retries} attempts: {error_msg}"
+            job.completed_at = datetime.now(timezone.utc)
+            await self._save_job(job)
+            await self._redis.hincrby(_KEY_META, "total_failed", 1)
+            logger.error(f"Job failed permanently: {job.id} - {error_msg}")
+
+    async def _cleanup_worker(self) -> None:
+        """Periodic cleanup of expired job references from sets."""
+        while self._running:
+            try:
+                await asyncio.sleep(self._settings.cleanup_interval_seconds)
+                await self._cleanup_expired_references()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Cleanup worker error: {e}")
+
+    async def _cleanup_expired_references(self) -> None:
+        """Remove references to jobs that have expired (TTL gone)."""
+        all_ids = await self._redis.smembers(_KEY_ALL_JOBS)
+        removed = 0
+
+        for job_id in all_ids:
+            exists = await self._redis.exists(_KEY_JOB.format(job_id=job_id))
+            if not exists:
+                # Job expired via TTL, clean up set references
+                await self._redis.srem(_KEY_ALL_JOBS, job_id)
+                for status in JobStatus:
+                    await self._redis.srem(
+                        _KEY_STATUS_SET.format(status=status.value), job_id
+                    )
+                removed += 1
+
+        if removed:
+            logger.info(f"Cleaned up {removed} expired job references")
 
 
 # Global job queue instance
-_job_queue: JobQueue | None = None
+_job_queue: RedisJobQueue | None = None
 
 
-def get_job_queue() -> JobQueue:
-    """Get or create global job queue."""
-    global _job_queue  # noqa: PLW0603
+def get_job_queue() -> RedisJobQueue:
+    """Get global job queue instance."""
     if _job_queue is None:
-        _job_queue = JobQueue(max_concurrent=3)
+        raise RuntimeError("Job queue not initialized. Call setup_job_queue() first.")
     return _job_queue
 
 
-async def setup_job_queue(scraper_service: Any) -> JobQueue:
+async def setup_job_queue(
+    redis: Redis,
+    settings: JobQueueSettings,
+    scraper_service: Any,
+) -> RedisJobQueue:
     """
-    Setup and start the job queue with handlers.
+    Setup and start the Redis-backed job queue with handlers.
 
     Args:
+        redis: Async Redis client
+        settings: Job queue configuration
         scraper_service: ScraperService instance for job handlers
 
     Returns:
-        Configured JobQueue
+        Configured RedisJobQueue
     """
-    queue = get_job_queue()
+    global _job_queue  # noqa: PLW0603
+
+    queue = RedisJobQueue(redis=redis, settings=settings)
 
     # Register job handlers
     async def scrape_list_handler(
@@ -292,13 +538,12 @@ async def setup_job_queue(scraper_service: Any) -> JobQueue:
         max_pages: int = 1,
         sort_by: str = "relevancy",
     ) -> dict[str, Any]:
-        """Handler for scrape list jobs - returns ExportOutput format."""
-        # search_products now returns ExportOutput-compatible dict
+        """Handler for scrape list jobs."""
         return await scraper_service.search_products(
             keyword=keyword,
             max_pages=max_pages,
             sort_by=sort_by,
-            max_reviews=5,  # Default reviews per product
+            max_reviews=5,
         )
 
     async def scrape_list_and_details_handler(
@@ -306,9 +551,7 @@ async def setup_job_queue(scraper_service: Any) -> JobQueue:
         max_products: int = 10,
         include_reviews: bool = False,
     ) -> dict[str, Any]:
-        """Handler for scrape list and details jobs - returns ExportOutput format."""
-        # get_products_batch returns ExportOutput-compatible dict
-        # Reviews are already included via scraper.search()
+        """Handler for scrape list and details jobs."""
         max_reviews = 5 if include_reviews else 0
         return await scraper_service.get_products_batch(
             keyword=keyword,
@@ -322,6 +565,7 @@ async def setup_job_queue(scraper_service: Any) -> JobQueue:
     # Start the queue
     await queue.start()
 
+    _job_queue = queue
     return queue
 
 
