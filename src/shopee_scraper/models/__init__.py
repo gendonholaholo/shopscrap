@@ -13,6 +13,7 @@ from shopee_scraper.models.output import (
     SpecsInfo,
     VariantInfo,
     VariantOption,
+    to_dict,
 )
 
 
@@ -29,4 +30,5 @@ __all__ = [
     "SpecsInfo",
     "VariantInfo",
     "VariantOption",
+    "to_dict",
 ]

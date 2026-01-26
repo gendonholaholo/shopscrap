@@ -8,7 +8,7 @@ from typing import Any
 
 import aiofiles
 
-from shopee_scraper.models.output import ExportOutput
+from shopee_scraper.models.output import ExportOutput, to_dict
 from shopee_scraper.storage.base import BaseStorage
 
 
@@ -39,7 +39,7 @@ class JsonStorage(BaseStorage):
         path = self.output_dir / filename
 
         # Convert ExportOutput to dict if needed
-        output_data = data.to_dict() if isinstance(data, ExportOutput) else data
+        output_data = to_dict(data) if isinstance(data, ExportOutput) else data
 
         async with aiofiles.open(path, "w") as f:
             await f.write(json.dumps(output_data, indent=2, ensure_ascii=False))

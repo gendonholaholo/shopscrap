@@ -7,21 +7,22 @@ import re
 from typing import TYPE_CHECKING, Any
 
 from shopee_scraper.extractors.base import BaseExtractor
-from shopee_scraper.utils.constants import BASE_URL, PRICE_DIVISOR
+from shopee_scraper.utils.constants import (
+    BASE_URL,
+    ITEM_API,
+    PRICE_DIVISOR,
+    PRODUCT_API,
+    PRODUCT_API_PATTERNS,
+)
 from shopee_scraper.utils.logging import get_logger
 from shopee_scraper.utils.network_interceptor import NetworkInterceptor
 
 
 if TYPE_CHECKING:
     from shopee_scraper.core.browser import BrowserManager, Page
+    from shopee_scraper.utils.captcha_solver import CaptchaSolver
 
 logger = get_logger(__name__)
-
-# Shopee product API endpoints to intercept
-PRODUCT_API_PATTERNS = [
-    "/api/v4/pdp/get_pc",
-    "/api/v4/item/get",
-]
 
 
 class ProductExtractor(BaseExtractor):
@@ -38,15 +39,20 @@ class ProductExtractor(BaseExtractor):
     less frequently than DOM selectors.
     """
 
-    def __init__(self, browser: BrowserManager) -> None:
+    def __init__(
+        self,
+        browser: BrowserManager,
+        captcha_solver: CaptchaSolver | None = None,
+    ) -> None:
         """
         Initialize product extractor.
 
         Args:
             browser: BrowserManager instance
+            captcha_solver: Optional CaptchaSolver for auto-solving captchas
         """
         self.browser = browser
-        self._intercepted_data: dict[str, Any] = {}
+        self.captcha_solver = captcha_solver
         self._use_network_interception = True  # Primary strategy
 
     async def get_product(
@@ -90,8 +96,11 @@ class ProductExtractor(BaseExtractor):
             # Build product URL
             product_url = f"{BASE_URL}/product/{shop_id}/{item_id}"
 
-            # Navigate to product page
-            await self.browser.goto(page, product_url)
+            # Navigate to product page with captcha handling
+            navigation_ok = await self._navigate_with_retry(page, product_url)
+            if not navigation_ok:
+                logger.error("Failed to navigate to product page (captcha/login issue)")
+                return {}
 
             # Scroll to load content and trigger API calls
             await self.browser.scroll_page(page, scroll_count=2)
@@ -139,14 +148,14 @@ class ProductExtractor(BaseExtractor):
         """
         # Try pdp/get_pc first (primary endpoint)
         response = await interceptor.wait_for_response(
-            "/api/v4/pdp/get_pc",
+            PRODUCT_API,
             timeout=timeout,
         )
 
         if not response or not response.body_json:
             # Try alternative endpoint
             response = await interceptor.wait_for_response(
-                "/api/v4/item/get",
+                ITEM_API,
                 timeout=5.0,
             )
 
@@ -379,30 +388,6 @@ class ProductExtractor(BaseExtractor):
         except Exception as e:
             logger.error(f"DOM extraction failed: {e}")
             return {}
-
-    def _parse_structured_data(
-        self,
-        data: dict[str, Any],
-        shop_id: int,
-        item_id: int,
-    ) -> dict[str, Any]:
-        """Parse JSON-LD structured data."""
-        offers = data.get("offers", {})
-
-        return {
-            "item_id": item_id,
-            "shop_id": shop_id,
-            "name": data.get("name", ""),
-            "description": data.get("description", ""),
-            "price": float(offers.get("price", 0)),
-            "currency": offers.get("priceCurrency", "IDR"),
-            "availability": offers.get("availability", ""),
-            "image": data.get("image", ""),
-            "brand": data.get("brand", {}).get("name", ""),
-            "rating": float(data.get("aggregateRating", {}).get("ratingValue", 0)),
-            "rating_count": int(data.get("aggregateRating", {}).get("reviewCount", 0)),
-            "url": f"{BASE_URL}/product/{shop_id}/{item_id}",
-        }
 
     def parse(self, raw_data: dict[str, Any]) -> dict[str, Any]:
         """Parse and structure product data from API."""

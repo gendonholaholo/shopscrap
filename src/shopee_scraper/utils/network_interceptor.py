@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 import nodriver.cdp.network as net
 
+from shopee_scraper.utils.constants import ALL_API_PATTERNS
 from shopee_scraper.utils.logging import get_logger
 
 
@@ -80,13 +81,8 @@ class NetworkInterceptor:
         if url_patterns:
             self.url_patterns = url_patterns
         else:
-            # Default Shopee API patterns
-            self.url_patterns = [
-                "/api/v4/search/search_items",
-                "/api/v4/pdp/get_pc",
-                "/api/v4/item/get",
-                "/api/v2/item/get_ratings",
-            ]
+            # Default Shopee API patterns from constants
+            self.url_patterns = list(ALL_API_PATTERNS)
 
         # Enable network monitoring
         await self.tab.send(net.enable())
@@ -232,41 +228,3 @@ class NetworkInterceptor:
     def clear_responses(self) -> None:
         """Clear all captured responses."""
         self._responses.clear()
-
-
-async def intercept_shopee_api(
-    tab: Tab,
-    navigate_url: str,
-    api_pattern: str,
-    timeout: float = 30.0,
-) -> dict[str, Any] | None:
-    """
-    Convenience function to intercept Shopee API response.
-
-    Args:
-        tab: nodriver Tab instance
-        navigate_url: URL to navigate to
-        api_pattern: API URL pattern to capture (e.g., "/api/v4/search/search_items")
-        timeout: Maximum wait time
-
-    Returns:
-        Parsed JSON response or None
-    """
-    interceptor = NetworkInterceptor(tab)
-
-    try:
-        await interceptor.start([api_pattern])
-
-        # Navigate to page
-        await tab.get(navigate_url)
-
-        # Wait for API response
-        response = await interceptor.wait_for_response(api_pattern, timeout=timeout)
-
-        if response and response.body_json:
-            return response.body_json
-
-        return None
-
-    finally:
-        await interceptor.stop()

@@ -7,7 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from shopee_scraper.api.jobs import JobStatus
+from shopee_scraper.api.enums import JobStatus
 
 
 # =============================================================================

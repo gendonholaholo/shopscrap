@@ -6,11 +6,16 @@ import asyncio
 from pathlib import Path
 
 import typer
+from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Table
 
 from shopee_scraper import __version__
 from shopee_scraper.utils.logging import setup_logging
+
+
+# Load environment variables from .env file
+load_dotenv()
 
 
 app = typer.Typer(

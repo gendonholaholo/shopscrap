@@ -112,6 +112,12 @@ def load_proxies_from_env() -> ProxyPool:
 
     pool = ProxyPool()
 
+    # Check if proxy is enabled
+    proxy_enabled = os.getenv("PROXY_ENABLED", "false").lower() in ("true", "1", "yes")
+    if not proxy_enabled:
+        logger.info("Proxy disabled via PROXY_ENABLED=false")
+        return pool
+
     # Single proxy from env
     proxy_host = os.getenv("PROXY_HOST", "")
     proxy_port = os.getenv("PROXY_PORT", "")
@@ -124,5 +130,6 @@ def load_proxies_from_env() -> ProxyPool:
             password=os.getenv("PROXY_PASSWORD", ""),
             protocol=os.getenv("PROXY_PROTOCOL", "http"),
         )
+        logger.info(f"Proxy loaded: {proxy_host}:{proxy_port}")
 
     return pool

@@ -7,7 +7,12 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
 from shopee_scraper.extractors.base import BaseExtractor
-from shopee_scraper.utils.constants import BASE_URL, PRICE_DIVISOR
+from shopee_scraper.utils.constants import (
+    BASE_URL,
+    PRICE_DIVISOR,
+    SEARCH_API,
+    SEARCH_API_PATTERNS,
+)
 from shopee_scraper.utils.logging import get_logger
 from shopee_scraper.utils.network_interceptor import NetworkInterceptor
 from shopee_scraper.utils.parsers import parse_price, parse_sold_count
@@ -15,15 +20,9 @@ from shopee_scraper.utils.parsers import parse_price, parse_sold_count
 
 if TYPE_CHECKING:
     from shopee_scraper.core.browser import BrowserManager, Page
+    from shopee_scraper.utils.captcha_solver import CaptchaSolver
 
 logger = get_logger(__name__)
-
-# Shopee search API endpoints to intercept
-SEARCH_API_PATTERNS = [
-    "/api/v4/search/search_items",
-    "/api/v4/recommend/recommend",
-    "/api/v4/search/search_hint",
-]
 
 
 class SearchExtractor(BaseExtractor):
@@ -38,14 +37,20 @@ class SearchExtractor(BaseExtractor):
     less frequently than DOM selectors.
     """
 
-    def __init__(self, browser: BrowserManager) -> None:
+    def __init__(
+        self,
+        browser: BrowserManager,
+        captcha_solver: CaptchaSolver | None = None,
+    ) -> None:
         """
         Initialize search extractor.
 
         Args:
             browser: BrowserManager instance
+            captcha_solver: Optional CaptchaSolver for auto-solving captchas
         """
         self.browser = browser
+        self.captcha_solver = captcha_solver
         self._use_network_interception = True  # Primary strategy
 
     async def search(
@@ -132,26 +137,16 @@ class SearchExtractor(BaseExtractor):
                 await self.browser.scroll_page(page, scroll_count=3)
                 await asyncio.sleep(2)
 
-                # Extraction strategy priority:
-                # 1. Network interception (CDP) - most reliable for API data
-                # 2. JavaScript global state (SSR hydration data)
-                # 3. DOM extraction - fallback for parsing page elements
-                products: list[dict[str, Any]] = []
+                # Extract products with verify redirect handling
+                (
+                    products,
+                    should_stop,
+                ) = await self._extract_products_with_verify_handling(
+                    page, interceptor, search_url
+                )
 
-                # Strategy 1: Network interception
-                if interceptor:
-                    products = await self._extract_from_network(interceptor)
-
-                # Strategy 2: JavaScript global state (Shopee SSR hydration)
-                if not products:
-                    logger.debug("Trying JS global state extraction")
-                    products = await self._extract_from_js_state(page)
-
-                # Strategy 3: DOM extraction fallback
-                if not products:
-                    logger.debug("Falling back to DOM extraction")
-                    await self.browser.scroll_page(page, scroll_count=2)
-                    products = await self._extract_from_dom(page)
+                if should_stop:
+                    break
 
                 all_products.extend(products)
                 logger.info(
@@ -191,7 +186,7 @@ class SearchExtractor(BaseExtractor):
         """
         # Wait for search API response
         response = await interceptor.wait_for_response(
-            "/api/v4/search/search_items",
+            SEARCH_API,
             timeout=timeout,
         )
 
@@ -356,37 +351,65 @@ class SearchExtractor(BaseExtractor):
             logger.warning(f"Failed to parse JS state data: {e}")
             return []
 
-    async def _navigate_with_retry(
-        self, page: Page, url: str, max_retries: int = 3
-    ) -> bool:
-        """Navigate to URL with retry on traffic verification."""
-        for attempt in range(max_retries):
-            await self.browser.goto(page, url)
+    async def _extract_products_with_verify_handling(
+        self,
+        page: Page,
+        interceptor: NetworkInterceptor | None,
+        search_url: str,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """
+        Extract products using multiple strategies with verify redirect handling.
 
-            current_url = page.target.url or ""
+        Returns:
+            Tuple of (products list, should_stop flag)
+        """
+        products = await self._try_all_extraction_strategies(page, interceptor)
 
-            # Login required - not recoverable
-            if "/buyer/login" in current_url:
-                return False
-
-            # Not on verify page - success
-            if "/verify/" not in current_url:
-                return True
-
-            # On verify page - wait briefly then retry
+        # Check if redirected to verify page after extraction attempts
+        current_url = page.target.url or ""
+        if not products and "/verify/" in current_url:
             logger.warning(
-                f"Traffic verification (attempt {attempt + 1}/{max_retries})",
+                "Redirected to verification page during extraction",
                 url=current_url,
             )
-            await asyncio.sleep(5)
+            # Try to solve captcha
+            if await self._handle_verify_redirect(page, search_url):
+                # Retry extraction after solving
+                if interceptor:
+                    interceptor.clear_responses()
+                    await self.browser.scroll_page(page, scroll_count=3)
+                    await asyncio.sleep(2)
+                products = await self._try_all_extraction_strategies(page, interceptor)
+            else:
+                logger.error("Failed to resolve verification, stopping search")
+                return [], True
 
-            # Check if verify resolved on its own
-            current_url = page.target.url or ""
-            if "/verify/" not in current_url:
-                return True
+        return products, False
 
-        logger.error("Traffic verification persists after retries")
-        return False
+    async def _try_all_extraction_strategies(
+        self,
+        page: Page,
+        interceptor: NetworkInterceptor | None,
+    ) -> list[dict[str, Any]]:
+        """Try all extraction strategies in priority order."""
+        products: list[dict[str, Any]] = []
+
+        # Strategy 1: Network interception (most reliable)
+        if interceptor:
+            products = await self._extract_from_network(interceptor)
+
+        # Strategy 2: JavaScript global state
+        if not products:
+            logger.debug("Trying JS global state extraction")
+            products = await self._extract_from_js_state(page)
+
+        # Strategy 3: DOM extraction fallback
+        if not products:
+            logger.debug("Falling back to DOM extraction")
+            await self.browser.scroll_page(page, scroll_count=2)
+            products = await self._extract_from_dom(page)
+
+        return products
 
     def _parse_api_response(self, data: dict[str, Any]) -> list[dict[str, Any]]:
         """Parse API response into product list."""

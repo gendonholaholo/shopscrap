@@ -8,8 +8,9 @@ from fastapi import APIRouter, HTTPException, Path, Query, status
 from pydantic import BaseModel, Field
 
 from shopee_scraper.api.dependencies import RequireApiKey, ScraperServiceDep
-from shopee_scraper.api.jobs import QueueFullError, get_job_queue
+from shopee_scraper.api.jobs import get_job_queue
 from shopee_scraper.api.schemas import ErrorResponse, ProductLinks, SortOrder
+from shopee_scraper.exceptions import QueueFullError
 
 
 router = APIRouter(prefix="/products", tags=["Products"])

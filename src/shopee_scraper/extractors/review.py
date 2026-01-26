@@ -8,21 +8,21 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from shopee_scraper.extractors.base import BaseExtractor
-from shopee_scraper.utils.constants import BASE_URL
+from shopee_scraper.utils.constants import (
+    BASE_URL,
+    REVIEW_API,
+    REVIEW_API_PATTERNS,
+    REVIEW_RATINGS_API,
+)
 from shopee_scraper.utils.logging import get_logger
 from shopee_scraper.utils.network_interceptor import NetworkInterceptor
 
 
 if TYPE_CHECKING:
     from shopee_scraper.core.browser import BrowserManager, Page
+    from shopee_scraper.utils.captcha_solver import CaptchaSolver
 
 logger = get_logger(__name__)
-
-# Shopee review API endpoints to intercept
-REVIEW_API_PATTERNS = [
-    "/api/v2/item/get_ratings",
-    "/api/v4/pdp/get_rw",
-]
 
 
 class ReviewExtractor(BaseExtractor):
@@ -39,20 +39,20 @@ class ReviewExtractor(BaseExtractor):
     less frequently than DOM selectors.
     """
 
-    # Review filter types
-    FILTER_ALL = 0
-    FILTER_WITH_COMMENT = 1
-    FILTER_WITH_MEDIA = 2
-
-    def __init__(self, browser: BrowserManager) -> None:
+    def __init__(
+        self,
+        browser: BrowserManager,
+        captcha_solver: CaptchaSolver | None = None,
+    ) -> None:
         """
         Initialize review extractor.
 
         Args:
             browser: BrowserManager instance
+            captcha_solver: Optional CaptchaSolver for auto-solving captchas
         """
         self.browser = browser
-        self._intercepted_data: list[dict[str, Any]] = []
+        self.captcha_solver = captcha_solver
         self._use_network_interception = True  # Primary strategy
 
     async def get_reviews(
@@ -100,9 +100,12 @@ class ReviewExtractor(BaseExtractor):
                 await interceptor.start(REVIEW_API_PATTERNS)
                 logger.debug("Network interception enabled for reviews")
 
-            # Navigate to product page
+            # Navigate to product page with captcha handling
             product_url = f"{BASE_URL}/product/{shop_id}/{item_id}"
-            await self.browser.goto(page, product_url)
+            navigation_ok = await self._navigate_with_retry(page, product_url)
+            if not navigation_ok:
+                logger.error("Failed to navigate to product page (captcha/login issue)")
+                return []
 
             # Scroll down to load reviews section
             await self.browser.scroll_page(page, scroll_count=5)
@@ -156,14 +159,14 @@ class ReviewExtractor(BaseExtractor):
         """
         # Try get_ratings first (primary endpoint)
         response = await interceptor.wait_for_response(
-            "/api/v2/item/get_ratings",
+            REVIEW_RATINGS_API,
             timeout=timeout,
         )
 
         if not response or not response.body_json:
             # Try alternative endpoint
             response = await interceptor.wait_for_response(
-                "/api/v4/pdp/get_rw",
+                REVIEW_API,
                 timeout=5.0,
             )
 
@@ -320,7 +323,10 @@ class ReviewExtractor(BaseExtractor):
 
         try:
             product_url = f"{BASE_URL}/product/{shop_id}/{item_id}"
-            await self.browser.goto(page, product_url)
+            navigation_ok = await self._navigate_with_retry(page, product_url)
+            if not navigation_ok:
+                logger.error("Failed to navigate to product page (captcha/login issue)")
+                return {"shop_id": shop_id, "item_id": item_id}
             await self.browser.scroll_page(page, scroll_count=3)
             await self.browser.random_delay(1.0, 2.0)
 
@@ -371,51 +377,6 @@ class ReviewExtractor(BaseExtractor):
 
         finally:
             await self.browser.close_page(page)
-
-    # TODO: Refactor to use nodriver-compatible DOM extraction
-    async def _extract_review_summary(self, page: Page) -> dict[str, Any]:
-        """Extract review summary from DOM."""
-        rating_breakdown: dict[int, int] = {}
-        summary: dict[str, Any] = {
-            "total_reviews": 0,
-            "average_rating": 0.0,
-            "rating_breakdown": rating_breakdown,
-        }
-
-        try:
-            # Get average rating
-            rating_el = await page.query_selector("[class*='rating-star'] + span")
-            if rating_el:
-                rating_text = await rating_el.inner_text()
-                with contextlib.suppress(ValueError):
-                    summary["average_rating"] = float(rating_text)
-
-            # Get total reviews
-            count_el = await page.query_selector("[class*='rating-count']")
-            if count_el:
-                count_text = await count_el.inner_text()
-                import re
-
-                match = re.search(r"(\d+)", count_text.replace(".", ""))
-                if match:
-                    summary["total_reviews"] = int(match.group(1))
-
-            # Get rating breakdown
-            breakdown_els = await page.query_selector_all("[class*='rating-filter']")
-            for el in breakdown_els:
-                text = await el.inner_text()
-                import re
-
-                match = re.search(r"(\d)\s*(?:Bintang|Star)[^\d]*(\d+)", text)
-                if match:
-                    star = int(match.group(1))
-                    count = int(match.group(2).replace(".", ""))
-                    rating_breakdown[star] = count
-
-        except Exception as e:
-            logger.warning(f"Failed to extract review summary: {e}")
-
-        return summary
 
     def _parse_api_response(self, data: dict[str, Any]) -> list[dict[str, Any]]:
         """Parse API response into review list."""
@@ -510,5 +471,5 @@ class ReviewExtractor(BaseExtractor):
 
     async def extract(self, page: Page) -> dict[str, Any]:
         """Extract data from current page (interface compliance)."""
-        summary = await self._extract_review_summary(page)
-        return {"summary": summary}
+        # Note: Use get_reviews() or get_reviews_summary() for actual extraction
+        return {"summary": {}}

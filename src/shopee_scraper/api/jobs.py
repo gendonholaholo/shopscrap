@@ -8,9 +8,10 @@ import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from enum import Enum
 from typing import TYPE_CHECKING, Any
 
+from shopee_scraper.api.enums import JobStatus  # noqa: F401 - re-exported
+from shopee_scraper.exceptions import QueueFullError
 from shopee_scraper.utils.config import JobQueueSettings
 from shopee_scraper.utils.logging import get_logger
 
@@ -21,16 +22,6 @@ if TYPE_CHECKING:
     from redis.asyncio import Redis
 
 logger = get_logger(__name__)
-
-
-class JobStatus(str, Enum):
-    """Job status enum."""
-
-    PENDING = "pending"
-    RUNNING = "running"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
 
 
 @dataclass
@@ -103,10 +94,6 @@ _KEY_STATUS_SET = "jobs:status:{status}"  # Set (job IDs by status)
 _KEY_ALL_JOBS = "jobs:all"  # Set (all job IDs)
 _KEY_META = "job_queue:meta"  # Hash (queue stats)
 _KEY_PUBSUB_JOB = "job:events:{job_id}"  # PubSub channel for job updates
-
-
-class QueueFullError(Exception):
-    """Raised when queue is at max capacity."""
 
 
 class RedisJobQueue:

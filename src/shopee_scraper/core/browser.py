@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import nodriver
+from nodriver.core.util import ProxyForwarder
 
 from shopee_scraper.utils.logging import get_logger
 from shopee_scraper.utils.proxy import ProxyConfig, ProxyPool
@@ -30,7 +31,7 @@ class BrowserManager:
 
     Features:
     - Undetectable browser automation (no WebDriver detection)
-    - Proxy support
+    - Proxy support with authentication via ProxyForwarder
     - Human-like behavior simulation
     - Session persistence via user data directory
     """
@@ -52,30 +53,50 @@ class BrowserManager:
         self._browser: nodriver.Browser | None = None
         self._pages: list[Page] = []
         self._current_proxy: ProxyConfig | None = None
+        self._proxy_forwarder: ProxyForwarder | None = None
+
+    async def _wait_for_proxy_ready(self, timeout: float = 10.0) -> bool:
+        """Wait for ProxyForwarder server to be ready.
+
+        Args:
+            timeout: Maximum seconds to wait for proxy server.
+
+        Returns:
+            True if proxy server is ready, False if timeout or error.
+        """
+        if not self._proxy_forwarder:
+            return False
+
+        start_time = asyncio.get_event_loop().time()
+        while asyncio.get_event_loop().time() - start_time < timeout:
+            if self._proxy_forwarder.server is not None:
+                # Verify server is actually serving by testing connection
+                try:
+                    _, writer = await asyncio.wait_for(
+                        asyncio.open_connection(
+                            self._proxy_forwarder.host,
+                            self._proxy_forwarder.port,
+                        ),
+                        timeout=1.0,
+                    )
+                    writer.close()
+                    await writer.wait_closed()
+                    logger.debug(
+                        "Proxy server connection test passed",
+                        host=self._proxy_forwarder.host,
+                        port=self._proxy_forwarder.port,
+                    )
+                    return True
+                except Exception as e:
+                    logger.debug("Proxy connection test failed, retrying", error=str(e))
+            await asyncio.sleep(0.1)
+
+        logger.error("Proxy forwarder failed to start within timeout", timeout=timeout)
+        return False
 
     async def start(self) -> None:
         """Start Chrome browser via nodriver."""
-        logger.info(
-            "Starting Chrome browser",
-            headless=self.headless,
-            has_proxy=self.proxy is not None
-            or (self.proxy_pool and not self.proxy_pool.is_empty),
-        )
-
-        user_data = self.user_data_dir or "./data/chrome_profile"
-        Path(user_data).mkdir(parents=True, exist_ok=True)
-
-        # Build browser args (nodriver handles --headless via its parameter)
-        browser_args = [
-            "--no-first-run",
-            "--no-default-browser-check",
-            # Required for Docker/containerized environments
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-        ]
-
-        # Get proxy configuration
+        # Determine which proxy to use
         current_proxy = None
         if self.proxy:
             current_proxy = self.proxy
@@ -84,17 +105,50 @@ class BrowserManager:
             if current_proxy:
                 logger.info("Using proxy from pool", host=current_proxy.host)
 
-        # For authenticated proxies, we use --proxy-server without credentials
-        # and handle authentication via CDP Fetch.authRequired
+        self._current_proxy = current_proxy
+
+        logger.info(
+            "Starting Chrome browser",
+            headless=self.headless,
+            has_proxy=current_proxy is not None,
+        )
+
+        user_data = self.user_data_dir or "./data/chrome_profile"
+        Path(user_data).mkdir(parents=True, exist_ok=True)
+
+        # Build browser args
+        browser_args = [
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+        ]
+
+        # Setup proxy with authentication via ProxyForwarder
         if current_proxy:
-            # Use proxy server without credentials in URL
-            proxy_server = (
-                f"{current_proxy.protocol}://{current_proxy.host}:{current_proxy.port}"
+            proxy_url = current_proxy.to_url()
+            logger.info(
+                "Setting up proxy forwarder",
+                host=current_proxy.host,
+                port=current_proxy.port,
             )
-            browser_args.append(f"--proxy-server={proxy_server}")
-            self._current_proxy = current_proxy
-        else:
-            self._current_proxy = None
+
+            # ProxyForwarder handles authenticated proxies by creating
+            # a local proxy that forwards to the upstream with auth
+            self._proxy_forwarder = ProxyForwarder(proxy_url)
+
+            # Wait for forwarder server to be fully ready (fixes Docker race condition)
+            if not await self._wait_for_proxy_ready(timeout=10.0):
+                logger.error("Proxy forwarder failed to start")
+                raise RuntimeError(
+                    "Failed to initialize proxy forwarder within timeout"
+                )
+
+            # Use the local proxy URL (no auth needed for Chrome)
+            local_proxy = self._proxy_forwarder.proxy_server
+            browser_args.append(f"--proxy-server={local_proxy}")
+            logger.info("Proxy forwarder ready", local_proxy=local_proxy)
 
         self._browser = await nodriver.start(
             headless=self.headless,
@@ -103,52 +157,7 @@ class BrowserManager:
             lang="id-ID",
         )
 
-        # Setup proxy authentication handler if we have credentials
-        if current_proxy and current_proxy.username and current_proxy.password:
-            await self._setup_proxy_auth(current_proxy)
-
         logger.info("Browser started successfully")
-
-    async def _setup_proxy_auth(self, proxy: ProxyConfig) -> None:
-        """Setup proxy authentication using CDP Fetch domain."""
-        from nodriver.cdp import fetch
-
-        if self._browser is None:
-            return
-
-        tab = self._browser.main_tab
-
-        # Enable Fetch with auth required handling
-        await tab.send(fetch.enable(handle_auth_requests=True))
-
-        # Add handler for auth challenges
-        async def handle_auth_required(event: fetch.AuthRequired) -> None:
-            """Handle 407 Proxy Authentication Required."""
-            logger.debug(
-                "Proxy auth required",
-                request_id=event.request_id,
-                host=proxy.host,
-            )
-            await tab.send(
-                fetch.continue_with_auth(
-                    request_id=event.request_id,
-                    auth_challenge_response=fetch.AuthChallengeResponse(
-                        response="ProvideCredentials",
-                        username=proxy.username,
-                        password=proxy.password,
-                    ),
-                )
-            )
-
-        # Add handler for continuing requests after auth
-        async def handle_request_paused(event: fetch.RequestPaused) -> None:
-            """Continue paused requests."""
-            await tab.send(fetch.continue_request(request_id=event.request_id))
-
-        tab.add_handler(fetch.AuthRequired, handle_auth_required)
-        tab.add_handler(fetch.RequestPaused, handle_request_paused)
-
-        logger.info("Proxy authentication handler configured")
 
     async def new_page(self) -> Page:
         """Create a new tab in the browser."""
@@ -278,6 +287,21 @@ class BrowserManager:
                 self._browser.stop()
             self._browser = None
 
+        # Cleanup proxy forwarder with timeout
+        if self._proxy_forwarder and self._proxy_forwarder.server:
+            try:
+                self._proxy_forwarder.server.close()
+                await asyncio.wait_for(
+                    self._proxy_forwarder.server.wait_closed(),
+                    timeout=5.0,
+                )
+                logger.debug("Proxy forwarder closed successfully")
+            except asyncio.TimeoutError:
+                logger.warning("Proxy forwarder cleanup timeout")
+            except Exception as e:
+                logger.warning("Proxy forwarder cleanup error", error=str(e))
+        self._proxy_forwarder = None
+
         logger.info("Browser closed")
 
     async def rotate_proxy(self) -> bool:
@@ -292,6 +316,11 @@ class BrowserManager:
             logger.info("Rotated to new proxy", host=self.proxy.host)
         await self.start()
         return True
+
+    @property
+    def current_proxy(self) -> ProxyConfig | None:
+        """Get the currently active proxy configuration."""
+        return self._current_proxy
 
     async def __aenter__(self) -> BrowserManager:
         """Async context manager entry."""

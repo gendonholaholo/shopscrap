@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from shopee_scraper.utils.constants import BASE_URL, LOGIN_URL
 from shopee_scraper.utils.logging import get_logger
 
 
@@ -29,8 +30,8 @@ class SessionManager:
     - Auto-refresh expired sessions
     """
 
-    LOGIN_URL = "https://shopee.co.id/buyer/login"
-    HOME_URL = "https://shopee.co.id"
+    # URLs imported from constants
+    HOME_URL = BASE_URL
 
     # Selectors for login page (multiple alternatives for resilience)
     SELECTORS = {
@@ -313,7 +314,7 @@ class SessionManager:
         max_retries = 3
 
         for attempt in range(max_retries):
-            await browser.goto(page, self.LOGIN_URL, wait_until="load")
+            await browser.goto(page, LOGIN_URL, wait_until="load")
             await browser.random_delay(3.0, 5.0)  # Wait longer for JS to render
 
             current_url = self._get_url(page)
@@ -328,10 +329,16 @@ class SessionManager:
                 logger.info("On login page", url=current_url)
                 return False
 
-            # If redirected to homepage, try again
-            if current_url.rstrip("/") == self.HOME_URL.rstrip("/"):
+            # If redirected to homepage, check if user is already logged in
+            if current_url.rstrip("/") == self.HOME_URL.rstrip("/") or current_url.startswith(self.HOME_URL):
+                # Check if already logged in via Chrome profile cookies
+                if await self._check_already_logged_in(page, browser):
+                    logger.info("Already logged in (detected from Chrome profile)")
+                    await self._save_session(browser, session_name)
+                    return True
+
                 logger.warning(
-                    f"Redirected to homepage, retrying... (attempt {attempt + 1}/{max_retries})"
+                    f"Redirected to homepage but not logged in, retrying... (attempt {attempt + 1}/{max_retries})"
                 )
                 await browser.random_delay(2.0, 3.0)
                 continue
@@ -342,6 +349,78 @@ class SessionManager:
 
         logger.error("Failed to reach login page after retries")
         return False
+
+    async def _check_already_logged_in(
+        self,
+        page: Page,
+        browser: BrowserManager,
+    ) -> bool:
+        """
+        Check if user is already logged in on homepage.
+
+        Checks for:
+        1. Auth cookies
+        2. Username/profile element in navbar
+
+        Returns:
+            True if logged in, False otherwise
+        """
+        try:
+            # Check 1: Look for auth cookies
+            cookies = await browser.get_cookies()
+            auth_cookie_names = {
+                "SPC_EC", "SPC_ST", "SPC_CDS", "SPC_U", "SPC_F",
+                "SPC_R_T_ID", "SPC_T_ID", "SPC_T_IV", "SPC_SI", "SPC_SEC_SI",
+            }
+            auth_cookies = [c for c in cookies if c.get("name") in auth_cookie_names]
+
+            if auth_cookies:
+                logger.info(
+                    "Auth cookies found - user is logged in",
+                    cookie_names=[c.get("name") for c in auth_cookies],
+                )
+                return True
+
+            # Check 2: Look for username element in navbar
+            username_selectors = [
+                "[class*='navbar__username']",
+                "[class*='stardust-popover'] [class*='shopee-avatar']",
+                "[class*='navbar'] [class*='avatar']",
+                ".navbar-link--account",
+                "[data-testid='account-drawer']",
+            ]
+
+            for selector in username_selectors:
+                try:
+                    element = await page.find(selector, timeout=2)
+                    if element:
+                        logger.info(f"User profile element found with selector: {selector}")
+                        return True
+                except Exception:
+                    continue
+
+            # Check 3: Run JS to find username in navbar
+            has_username = await page.evaluate("""
+                (() => {
+                    // Look for navbar username text
+                    const navbarText = document.querySelector('.navbar')?.textContent || '';
+                    // Look for account-related elements
+                    const accountEl = document.querySelector('[class*="account"]');
+                    const avatarEl = document.querySelector('[class*="avatar"]');
+                    // Check if there's a logged-in indicator
+                    return accountEl !== null || avatarEl !== null || navbarText.includes('@');
+                })()
+            """)
+
+            if has_username:
+                logger.info("User appears to be logged in (detected via JS)")
+                return True
+
+            return False
+
+        except Exception as e:
+            logger.warning(f"Error checking login status: {e}")
+            return False
 
     async def _wait_for_login_form(
         self,

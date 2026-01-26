@@ -54,17 +54,26 @@ class ShopeeScraper:
             use_anticaptcha: Enable 2Captcha auto-solving
             twocaptcha_api_key: 2Captcha API key (or use env TWOCAPTCHA_API_KEY)
         """
+        import os
+
         self.headless = headless
         self.proxy_pool = proxy_pool or load_proxies_from_env()
         self.output_dir = Path(output_dir)
         self.session_dir = Path(session_dir)
         self.session_name = session_name
-        self.use_anticaptcha = use_anticaptcha
 
-        # Initialize CAPTCHA solver if enabled
-        captcha_solver = None
-        if use_anticaptcha:
-            captcha_solver = create_captcha_solver(
+        # Auto-enable captcha solving from environment if not explicitly passed
+        captcha_enabled_env = os.getenv("CAPTCHA_ENABLED", "false").lower() in (
+            "true",
+            "1",
+            "yes",
+        )
+        self.use_anticaptcha = use_anticaptcha or captcha_enabled_env
+
+        # Initialize CAPTCHA solver if enabled (via param or env)
+        self.captcha_solver = None
+        if self.use_anticaptcha:
+            self.captcha_solver = create_captcha_solver(
                 api_key=twocaptcha_api_key,
                 enabled=True,
             )
@@ -76,7 +85,7 @@ class ShopeeScraper:
         )
         self.session = SessionManager(
             session_dir=str(self.session_dir),
-            captcha_solver=captcha_solver,
+            captcha_solver=self.captcha_solver,
             use_anticaptcha=use_anticaptcha,
         )
         self.storage = JsonStorage(output_dir=str(self.output_dir))
@@ -96,10 +105,10 @@ class ShopeeScraper:
         logger.info("Starting Shopee scraper")
         await self.browser.start()
 
-        # Initialize extractors
-        self._search_extractor = SearchExtractor(self.browser)
-        self._product_extractor = ProductExtractor(self.browser)
-        self._review_extractor = ReviewExtractor(self.browser)
+        # Initialize extractors with captcha solver
+        self._search_extractor = SearchExtractor(self.browser, self.captcha_solver)
+        self._product_extractor = ProductExtractor(self.browser, self.captcha_solver)
+        self._review_extractor = ReviewExtractor(self.browser, self.captcha_solver)
 
         # Try to restore saved session
         await self._try_restore_session()
