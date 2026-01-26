@@ -5,15 +5,19 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastapi import Depends
-from redis.asyncio import Redis
+from redis.asyncio import ConnectionPool, Redis
 
 from shopee_scraper.api.auth import get_api_key, optional_api_key
 from shopee_scraper.services.scraper_service import ScraperService
 from shopee_scraper.utils.config import get_settings
+from shopee_scraper.utils.logging import get_logger
 
+
+logger = get_logger(__name__)
 
 # Global service instances (singleton pattern)
 _scraper_service: ScraperService | None = None
+_redis_pool: ConnectionPool | None = None
 _redis_client: Redis | None = None
 
 
@@ -34,23 +38,51 @@ async def cleanup_scraper_service() -> None:
 
 
 async def get_redis() -> Redis:
-    """Get or create async Redis client for job queue."""
-    global _redis_client  # noqa: PLW0603
+    """
+    Get async Redis client with connection pooling.
+
+    Uses a shared connection pool for better performance under load.
+    Pool configuration is controlled via JOB_QUEUE_REDIS_POOL_SIZE and
+    JOB_QUEUE_REDIS_POOL_TIMEOUT environment variables.
+    """
+    global _redis_pool, _redis_client  # noqa: PLW0603
+
     if _redis_client is None:
         settings = get_settings()
-        _redis_client = Redis.from_url(
-            settings.job_queue.redis_url,
+        job_queue_settings = settings.job_queue
+
+        # Create connection pool
+        _redis_pool = ConnectionPool.from_url(
+            job_queue_settings.redis_url,
+            max_connections=job_queue_settings.redis_pool_size,
+            socket_timeout=job_queue_settings.redis_pool_timeout,
             decode_responses=True,
         )
+
+        # Create Redis client using the pool
+        _redis_client = Redis(connection_pool=_redis_pool)
+
+        logger.info(
+            "Redis connection pool initialized",
+            pool_size=job_queue_settings.redis_pool_size,
+            url=job_queue_settings.redis_url.split("@")[-1],  # Hide credentials
+        )
+
     return _redis_client
 
 
 async def cleanup_redis() -> None:
-    """Close Redis connection on shutdown."""
-    global _redis_client  # noqa: PLW0603
+    """Close Redis connection pool on shutdown."""
+    global _redis_pool, _redis_client  # noqa: PLW0603
+
     if _redis_client:
         await _redis_client.aclose()
         _redis_client = None
+
+    if _redis_pool:
+        await _redis_pool.disconnect()
+        _redis_pool = None
+        logger.info("Redis connection pool closed")
 
 
 # Type aliases for dependency injection

@@ -45,9 +45,13 @@ class JsonStorage(BaseStorage):
             await f.write(json.dumps(output_data, indent=2, ensure_ascii=False))
         return str(path)
 
-    async def load(self, filename: str) -> dict[str, Any]:
+    async def load(self, filename: str) -> list[dict[str, Any]]:
         """Load data from JSON file."""
         path = self.output_dir / filename
         async with aiofiles.open(path) as f:
             content = await f.read()
-        return json.loads(content)
+        data = json.loads(content)
+        # Ensure we return a list
+        if isinstance(data, dict):
+            return [data]
+        return list(data)

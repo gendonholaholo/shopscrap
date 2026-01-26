@@ -30,6 +30,19 @@ services:
       # Auth (set API_KEYS in .env file)
       - API_AUTH_ENABLED=${API_AUTH_ENABLED:-false}
       - API_KEYS=${API_KEYS:-}
+      # Proxy (Residential Proxy)
+      - PROXY_ENABLED=${PROXY_ENABLED:-false}
+      - PROXY_HOST=${PROXY_HOST:-}
+      - PROXY_PORT=${PROXY_PORT:-}
+      - PROXY_USERNAME=${PROXY_USERNAME:-}
+      - PROXY_PASSWORD=${PROXY_PASSWORD:-}
+      - PROXY_ROTATE=${PROXY_ROTATE:-true}
+      - PROXY_COUNTRY=${PROXY_COUNTRY:-id}
+      # CAPTCHA Solver
+      - CAPTCHA_ENABLED=${CAPTCHA_ENABLED:-false}
+      - CAPTCHA_API_KEY=${CAPTCHA_API_KEY:-}
+      - CAPTCHA_PROVIDER=${CAPTCHA_PROVIDER:-2captcha}
+      - CAPTCHA_TIMEOUT=${CAPTCHA_TIMEOUT:-120}
     volumes:
       - ./data/output:/app/data/output
       - ./data/sessions:/app/data/sessions

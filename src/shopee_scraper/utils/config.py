@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,22 +19,40 @@ class BrowserSettings(BaseSettings):
 
 
 class ProxySettings(BaseSettings):
-    """Proxy configuration."""
+    """Proxy configuration for residential proxies."""
 
-    enabled: bool = False
-    host: str = ""
-    port: int = 0
-    username: str = ""
-    password: str = ""
+    model_config = SettingsConfigDict(
+        env_prefix="PROXY_",
+        env_file=".env",
+        extra="ignore",
+    )
+
+    enabled: bool = Field(default=False, description="Enable proxy")
+    host: str = Field(default="", description="Proxy host (e.g., gate.smartproxy.com)")
+    port: int = Field(default=0, description="Proxy port (e.g., 7000)")
+    username: str = Field(default="", description="Proxy username")
+    password: str = Field(default="", description="Proxy password")
+    # Rotating proxy support
+    rotate: bool = Field(default=True, description="Enable IP rotation per request")
+    country: str = Field(default="id", description="Target country code (id=Indonesia)")
 
     def to_dict(self) -> dict | None:
-        if not self.enabled:
+        """Convert to dict for browser manager."""
+        if not self.enabled or not self.host:
             return None
         return {
             "server": f"http://{self.host}:{self.port}",
             "username": self.username,
             "password": self.password,
         }
+
+    def to_url(self) -> str | None:
+        """Convert to proxy URL string."""
+        if not self.enabled or not self.host:
+            return None
+        if self.username and self.password:
+            return f"http://{self.username}:{self.password}@{self.host}:{self.port}"
+        return f"http://{self.host}:{self.port}"
 
 
 class RateLimitSettings(BaseSettings):
@@ -108,6 +127,10 @@ class CORSSettings(BaseSettings):
             return ["*"]
         return [h.strip() for h in self.allow_headers.split(",") if h.strip()]
 
+    def is_permissive(self) -> bool:
+        """Check if CORS is overly permissive (allows all origins)."""
+        return self.allow_origins == "*"
+
 
 class AuthSettings(BaseSettings):
     """API Authentication configuration."""
@@ -151,6 +174,14 @@ class JobQueueSettings(BaseSettings):
         default="redis://localhost:6379/1",
         description="Redis URL for job queue (DB 1, separate from rate limiter)",
     )
+    redis_pool_size: int = Field(
+        default=10,
+        description="Maximum connections in Redis pool",
+    )
+    redis_pool_timeout: int = Field(
+        default=20,
+        description="Timeout for getting connection from pool (seconds)",
+    )
     max_concurrent: int = Field(
         default=3,
         description="Maximum concurrent job workers",
@@ -181,18 +212,46 @@ class JobQueueSettings(BaseSettings):
     )
 
 
-class CaptchaSettings(BaseSettings):
-    """CAPTCHA solver configuration."""
+class CacheSettings(BaseSettings):
+    """Cache configuration for scraped data."""
 
     model_config = SettingsConfigDict(
+        env_prefix="CACHE_",
         env_file=".env",
         extra="ignore",
     )
 
-    enabled: bool = Field(default=False, alias="USE_ANTICAPTCHA")
-    api_key: str = Field(default="", alias="TWOCAPTCHA_API_KEY")
-    timeout: int = 120  # Max wait time for solving (seconds)
-    max_retries: int = 3  # Retry attempts for solving
+    enabled: bool = Field(
+        default=True,
+        description="Enable/disable product caching",
+    )
+    product_ttl_seconds: int = Field(
+        default=3600,
+        description="TTL for cached products (default: 1 hour)",
+    )
+    review_ttl_seconds: int = Field(
+        default=1800,
+        description="TTL for cached reviews (default: 30 minutes)",
+    )
+
+
+class CaptchaSettings(BaseSettings):
+    """CAPTCHA solver configuration (2Captcha/Anti-Captcha)."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="CAPTCHA_",
+        env_file=".env",
+        extra="ignore",
+    )
+
+    enabled: bool = Field(default=False, description="Enable CAPTCHA auto-solver")
+    api_key: str = Field(default="", description="2Captcha or Anti-Captcha API key")
+    provider: str = Field(
+        default="2captcha",
+        description="CAPTCHA provider: 2captcha or anticaptcha",
+    )
+    timeout: int = Field(default=120, description="Max wait time for solving (seconds)")
+    max_retries: int = Field(default=3, description="Retry attempts for solving")
 
 
 class Settings(BaseSettings):
@@ -213,9 +272,71 @@ class Settings(BaseSettings):
     cors: CORSSettings = Field(default_factory=CORSSettings)
     auth: AuthSettings = Field(default_factory=AuthSettings)
     job_queue: JobQueueSettings = Field(default_factory=JobQueueSettings)
+    cache: CacheSettings = Field(default_factory=CacheSettings)
     captcha: CaptchaSettings = Field(default_factory=CaptchaSettings)
     output_dir: Path = Path("./data/output")
     log_level: str = "INFO"
+
+    @model_validator(mode="after")
+    def validate_production_security(self) -> Settings:
+        """Validate security settings for production environment."""
+        if self.env == "production":
+            security_warnings: list[str] = []
+
+            # Check authentication
+            if not self.auth.auth_enabled:
+                security_warnings.append(
+                    "API_AUTH_ENABLED=false: Authentication is DISABLED in production! "
+                    "Set API_AUTH_ENABLED=true and configure API_KEYS."
+                )
+
+            # Check rate limiting
+            if not self.rate_limit.enabled:
+                security_warnings.append(
+                    "RATE_LIMIT_ENABLED=false: Rate limiting is DISABLED in production! "
+                    "Set RATE_LIMIT_ENABLED=true to prevent DoS attacks."
+                )
+
+            # Check CORS
+            if self.cors.is_permissive():
+                security_warnings.append(
+                    "CORS_ALLOW_ORIGINS=*: CORS allows ALL origins in production! "
+                    "Set specific origins like CORS_ALLOW_ORIGINS=https://yourdomain.com"
+                )
+
+            # Check debug mode
+            if self.debug:
+                security_warnings.append(
+                    "SHOPEE_DEBUG=true: Debug mode is ENABLED in production! "
+                    "Set SHOPEE_DEBUG=false to hide error details."
+                )
+
+            # Emit warnings
+            for warning_msg in security_warnings:
+                warnings.warn(warning_msg, UserWarning, stacklevel=2)
+
+        return self
+
+    @property
+    def is_production(self) -> bool:
+        """Check if running in production environment."""
+        return self.env == "production"
+
+    def get_security_warnings(self) -> list[str]:
+        """Get list of security warnings for current configuration."""
+        warnings_list: list[str] = []
+
+        if self.is_production:
+            if not self.auth.auth_enabled:
+                warnings_list.append("Authentication disabled in production")
+            if not self.rate_limit.enabled:
+                warnings_list.append("Rate limiting disabled in production")
+            if self.cors.is_permissive():
+                warnings_list.append("CORS allows all origins in production")
+            if self.debug:
+                warnings_list.append("Debug mode enabled in production")
+
+        return warnings_list
 
     # Convenience properties for backward compatibility
     @property

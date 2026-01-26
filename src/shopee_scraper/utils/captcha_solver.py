@@ -142,12 +142,17 @@ class CaptchaSolver:
 
     async def _solve_with_2captcha(self, image_base64: str) -> dict[str, Any] | None:
         """Send image to 2Captcha and get solution."""
+        if self._solver is None:
+            logger.error("2Captcha solver not initialized")
+            return None
+
         try:
             # Run in thread pool since 2captcha is synchronous
             loop = asyncio.get_event_loop()
+            solver = self._solver  # Capture for closure
 
-            def solve():
-                return self._solver.coordinates(
+            def solve() -> Any:
+                return solver.coordinates(
                     image_base64,
                     lang="en",
                 )
@@ -222,10 +227,10 @@ class CaptchaSolver:
 
     def get_balance(self) -> float | None:
         """Get 2Captcha account balance."""
-        if not self.is_available:
+        if not self.is_available or self._solver is None:
             return None
         try:
-            return self._solver.balance()
+            return float(self._solver.balance())
         except Exception as e:
             logger.error(f"Failed to get balance: {e}")
             return None

@@ -8,25 +8,35 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from shopee_scraper.extractors.base import BaseExtractor
-from shopee_scraper.utils.constants import BASE_URL, REVIEW_API
+from shopee_scraper.utils.constants import BASE_URL
 from shopee_scraper.utils.logging import get_logger
+from shopee_scraper.utils.network_interceptor import NetworkInterceptor
 
 
 if TYPE_CHECKING:
     from shopee_scraper.core.browser import BrowserManager, Page
 
-# Type alias for nodriver response (placeholder for review extractor refactoring)
-Response = object
-
 logger = get_logger(__name__)
+
+# Shopee review API endpoints to intercept
+REVIEW_API_PATTERNS = [
+    "/api/v2/item/get_ratings",
+    "/api/v4/pdp/get_rw",
+]
 
 
 class ReviewExtractor(BaseExtractor):
     """
     Extract product reviews from Shopee.
 
-    Uses Shopee's internal API v4:
-    - /api/v4/pdp/get_rw - Product reviews with ratings
+    Uses a two-tier extraction strategy:
+    1. Primary: Network interception (CDP) - captures Shopee's internal API responses
+       - /api/v2/item/get_ratings - Review list API
+       - /api/v4/pdp/get_rw - Product reviews with ratings
+    2. Fallback: DOM extraction - parses page elements when API interception fails
+
+    Network interception is more reliable as API response structures change
+    less frequently than DOM selectors.
     """
 
     # Review filter types
@@ -43,6 +53,7 @@ class ReviewExtractor(BaseExtractor):
         """
         self.browser = browser
         self._intercepted_data: list[dict[str, Any]] = []
+        self._use_network_interception = True  # Primary strategy
 
     async def get_reviews(
         self,
@@ -53,7 +64,11 @@ class ReviewExtractor(BaseExtractor):
         rating_filter: int = 0,
     ) -> list[dict[str, Any]]:
         """
-        Get reviews for a product using DOM extraction.
+        Get reviews for a product.
+
+        Uses network interception (CDP) as primary strategy to capture
+        Shopee's internal API responses. Falls back to DOM extraction
+        if network interception fails.
 
         Args:
             shop_id: Shop ID
@@ -70,11 +85,21 @@ class ReviewExtractor(BaseExtractor):
             shop_id=shop_id,
             item_id=item_id,
             max_reviews=max_reviews,
+            strategy="network_interception"
+            if self._use_network_interception
+            else "dom",
         )
 
         page = await self.browser.new_page()
+        interceptor: NetworkInterceptor | None = None
 
         try:
+            # Setup network interception if enabled
+            if self._use_network_interception:
+                interceptor = NetworkInterceptor(page)
+                await interceptor.start(REVIEW_API_PATTERNS)
+                logger.debug("Network interception enabled for reviews")
+
             # Navigate to product page
             product_url = f"{BASE_URL}/product/{shop_id}/{item_id}"
             await self.browser.goto(page, product_url)
@@ -83,8 +108,89 @@ class ReviewExtractor(BaseExtractor):
             await self.browser.scroll_page(page, scroll_count=5)
             await self.browser.random_delay(2.0, 3.0)
 
-            # Extract reviews from DOM using JavaScript
-            raw_reviews = await page.evaluate("""
+            # Try network interception first (more reliable)
+            all_reviews: list[dict[str, Any]] = []
+            if interceptor:
+                all_reviews = await self._extract_from_network(
+                    interceptor, shop_id, item_id, max_reviews
+                )
+
+            # Fallback to DOM extraction if network interception found nothing
+            if not all_reviews:
+                logger.debug("Falling back to DOM extraction for reviews")
+                all_reviews = await self._extract_reviews_from_dom(
+                    page, shop_id, item_id, max_reviews
+                )
+
+            logger.info(
+                f"Review extraction completed: {len(all_reviews)} reviews",
+                method="network" if interceptor and all_reviews else "dom",
+            )
+            return all_reviews[:max_reviews]
+
+        finally:
+            if interceptor:
+                await interceptor.stop()
+            await self.browser.close_page(page)
+
+    async def _extract_from_network(
+        self,
+        interceptor: NetworkInterceptor,
+        shop_id: int,
+        item_id: int,
+        max_reviews: int,
+        timeout: float = 10.0,
+    ) -> list[dict[str, Any]]:
+        """
+        Extract reviews from intercepted API responses.
+
+        Args:
+            interceptor: Active NetworkInterceptor instance
+            shop_id: Shop ID for the product
+            item_id: Item ID for the product
+            max_reviews: Maximum reviews to extract
+            timeout: Max wait time for API response
+
+        Returns:
+            List of parsed review dictionaries
+        """
+        # Try get_ratings first (primary endpoint)
+        response = await interceptor.wait_for_response(
+            "/api/v2/item/get_ratings",
+            timeout=timeout,
+        )
+
+        if not response or not response.body_json:
+            # Try alternative endpoint
+            response = await interceptor.wait_for_response(
+                "/api/v4/pdp/get_rw",
+                timeout=5.0,
+            )
+
+        if not response or not response.body_json:
+            logger.debug("No review API response intercepted")
+            return []
+
+        # Parse API response
+        reviews = self._parse_api_response(response.body_json)
+
+        if reviews:
+            logger.debug(
+                f"Network interception extracted {len(reviews)} reviews",
+                api_url=response.url[:60] if response.url else "",
+            )
+        return reviews[:max_reviews]
+
+    async def _extract_reviews_from_dom(
+        self,
+        page: Any,
+        shop_id: int,
+        item_id: int,
+        max_reviews: int,
+    ) -> list[dict[str, Any]]:
+        """Extract reviews from DOM using JavaScript evaluation."""
+        # Extract reviews from DOM using JavaScript
+        raw_reviews = await page.evaluate("""
                 (() => {
                     const reviews = [];
 
@@ -159,42 +265,39 @@ class ReviewExtractor(BaseExtractor):
                 })()
             """)
 
-            # Parse JSON result
-            all_reviews: list[dict[str, Any]] = []
-            if isinstance(raw_reviews, str):
-                try:
-                    parsed = json.loads(raw_reviews)
-                    for raw in parsed[:max_reviews]:
-                        review = {
-                            "rating_id": raw.get("index", 0),
-                            "item_id": item_id,
-                            "shop_id": shop_id,
-                            "order_id": 0,
-                            "author": {
-                                "user_id": 0,
-                                "username": raw.get("username", "Anonymous"),
-                                "avatar": "",
-                            },
-                            "rating": raw.get("rating", 5),
-                            "comment": raw.get("comment", ""),
-                            "variation": "",
-                            "images": raw.get("images", []),
-                            "videos": [],
-                            "likes": 0,
-                            "shop_reply": "",
-                            "is_anonymous": False,
-                            "created_at": raw.get("date", ""),
-                            "tags": [],
-                        }
-                        all_reviews.append(review)
-                except json.JSONDecodeError:
-                    pass
+        # Parse JSON result
+        all_reviews: list[dict[str, Any]] = []
+        if isinstance(raw_reviews, str):
+            try:
+                parsed = json.loads(raw_reviews)
+                for raw in parsed[:max_reviews]:
+                    review = {
+                        "rating_id": raw.get("index", 0),
+                        "item_id": item_id,
+                        "shop_id": shop_id,
+                        "order_id": 0,
+                        "author": {
+                            "user_id": 0,
+                            "username": raw.get("username", "Anonymous"),
+                            "avatar": "",
+                        },
+                        "rating": raw.get("rating", 5),
+                        "comment": raw.get("comment", ""),
+                        "variation": "",
+                        "images": raw.get("images", []),
+                        "videos": [],
+                        "likes": 0,
+                        "shop_reply": "",
+                        "is_anonymous": False,
+                        "created_at": raw.get("date", ""),
+                        "tags": [],
+                    }
+                    all_reviews.append(review)
+            except json.JSONDecodeError:
+                pass
 
-            logger.info(f"Review extraction completed: {len(all_reviews)} reviews")
-            return all_reviews
-
-        finally:
-            await self.browser.close_page(page)
+        logger.debug(f"DOM extraction found {len(all_reviews)} reviews")
+        return all_reviews
 
     async def get_reviews_summary(
         self,
@@ -269,95 +372,14 @@ class ReviewExtractor(BaseExtractor):
         finally:
             await self.browser.close_page(page)
 
-    async def _handle_response(self, response: Response) -> None:
-        """Handle intercepted API responses."""
-        url = response.url
-
-        if REVIEW_API in url and response.status == 200:
-            try:
-                data = await response.json()
-                self._intercepted_data.append(data)
-                logger.debug("Intercepted review API response")
-            except Exception as e:
-                logger.warning(f"Failed to parse review API response: {e}")
-
-    async def _scroll_to_reviews(self, page: Page) -> None:
-        """Scroll to the reviews section of the page."""
-        try:
-            # Find reviews section
-            selectors = [
-                "[class*='product-rating']",
-                "[class*='review']",
-                "#review",
-            ]
-
-            for selector in selectors:
-                element = await page.query_selector(selector)
-                if element:
-                    await element.scroll_into_view_if_needed()
-                    await self.browser.random_delay(0.5, 1.0)
-                    return
-
-            # Fallback: scroll down
-            await self.browser.scroll_page(page, scroll_count=5)
-
-        except Exception as e:
-            logger.warning(f"Failed to scroll to reviews: {e}")
-
-    async def _click_reviews_tab(self, page: Page) -> None:
-        """Click on reviews tab if separate from product info."""
-        try:
-            tab_selectors = [
-                "[class*='review-tab']",
-                "button:has-text('Ulasan')",
-                "[data-tab='reviews']",
-            ]
-
-            for selector in tab_selectors:
-                tab = await page.query_selector(selector)
-                if tab:
-                    await tab.click()
-                    await self.browser.random_delay(0.5, 1.0)
-                    return
-
-        except Exception as e:
-            logger.debug(f"No separate reviews tab: {e}")
-
-    async def _load_more_reviews(self, page: Page) -> bool:
-        """Click load more button or scroll to load more reviews."""
-        try:
-            # Try "load more" button
-            load_more_selectors = [
-                "button:has-text('Lihat Lebih')",
-                "button:has-text('Muat Lebih')",
-                "[class*='load-more']",
-            ]
-
-            for selector in load_more_selectors:
-                button = await page.query_selector(selector)
-                if button:
-                    is_visible = await button.is_visible()
-                    if is_visible:
-                        await button.click()
-                        await self.browser.random_delay(1.0, 2.0)
-                        return True
-
-            # Scroll to trigger lazy loading
-            await page.evaluate("window.scrollBy(0, 500)")
-            await self.browser.random_delay(0.5, 1.0)
-
-            return True
-
-        except Exception as e:
-            logger.warning(f"Failed to load more reviews: {e}")
-            return False
-
+    # TODO: Refactor to use nodriver-compatible DOM extraction
     async def _extract_review_summary(self, page: Page) -> dict[str, Any]:
         """Extract review summary from DOM."""
-        summary = {
+        rating_breakdown: dict[int, int] = {}
+        summary: dict[str, Any] = {
             "total_reviews": 0,
             "average_rating": 0.0,
-            "rating_breakdown": {},
+            "rating_breakdown": rating_breakdown,
         }
 
         try:
@@ -388,7 +410,7 @@ class ReviewExtractor(BaseExtractor):
                 if match:
                     star = int(match.group(1))
                     count = int(match.group(2).replace(".", ""))
-                    summary["rating_breakdown"][star] = count
+                    rating_breakdown[star] = count
 
         except Exception as e:
             logger.warning(f"Failed to extract review summary: {e}")

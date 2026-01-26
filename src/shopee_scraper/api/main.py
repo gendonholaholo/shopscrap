@@ -24,6 +24,7 @@ from shopee_scraper.api.routes import (
     products_router,
     reviews_router,
     session_router,
+    websocket_router,
 )
 from shopee_scraper.utils.config import get_settings
 from shopee_scraper.utils.logging import get_logger
@@ -46,10 +47,44 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         debug=settings.debug,
     )
 
+    # Log security warnings for production
+    security_warnings = settings.get_security_warnings()
+    if security_warnings:
+        logger.warning(
+            "SECURITY WARNINGS DETECTED",
+            environment=settings.env,
+            warnings=security_warnings,
+        )
+        for warning in security_warnings:
+            logger.warning(f"[SECURITY] {warning}")
+
     # Startup: Initialize Redis and job queue
     try:
         redis = await get_redis()
         scraper_service = await get_scraper_service()
+
+        # Initialize caching if enabled
+        if settings.cache.enabled:
+            from shopee_scraper.services.cache import ProductCache, ReviewCache
+
+            product_cache = ProductCache(
+                redis=redis,
+                ttl_seconds=settings.cache.product_ttl_seconds,
+            )
+            review_cache = ReviewCache(
+                redis=redis,
+                ttl_seconds=settings.cache.review_ttl_seconds,
+            )
+            scraper_service.set_caches(
+                product_cache=product_cache,
+                review_cache=review_cache,
+            )
+            logger.info(
+                "Caching enabled",
+                product_ttl=settings.cache.product_ttl_seconds,
+                review_ttl=settings.cache.review_ttl_seconds,
+            )
+
         await setup_job_queue(
             redis=redis,
             settings=settings.job_queue,
@@ -182,6 +217,7 @@ Running in **{settings.env}** mode.
     app.include_router(products_router, prefix="/api/v1")
     app.include_router(reviews_router, prefix="/api/v1")
     app.include_router(jobs_router, prefix="/api/v1")
+    app.include_router(websocket_router, prefix="/api/v1")  # WebSocket for real-time
     app.include_router(health_router)  # Health last
 
     return app

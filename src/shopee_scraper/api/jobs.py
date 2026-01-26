@@ -102,6 +102,7 @@ _KEY_QUEUE_PENDING = "job_queue:pending"  # List (job IDs, LPUSH/BRPOP)
 _KEY_STATUS_SET = "jobs:status:{status}"  # Set (job IDs by status)
 _KEY_ALL_JOBS = "jobs:all"  # Set (all job IDs)
 _KEY_META = "job_queue:meta"  # Hash (queue stats)
+_KEY_PUBSUB_JOB = "job:events:{job_id}"  # PubSub channel for job updates
 
 
 class QueueFullError(Exception):
@@ -217,20 +218,14 @@ class RedisJobQueue:
         job_id = str(uuid.uuid4())
         job = Job(id=job_id, type=job_type, params=params)
 
-        # Persist job to Redis
-        await self._save_job(job)
-
-        # Add to pending queue
-        await self._redis.lpush(_KEY_QUEUE_PENDING, job_id)
-
-        # Track in sets
-        await self._redis.sadd(_KEY_ALL_JOBS, job_id)
-        await self._redis.sadd(
-            _KEY_STATUS_SET.format(status=JobStatus.PENDING.value), job_id
-        )
-
-        # Update meta stats
-        await self._redis.hincrby(_KEY_META, "total_submitted", 1)
+        # Pipeline all Redis operations for atomicity and performance
+        pipe = self._redis.pipeline()
+        pipe.set(_KEY_JOB.format(job_id=job_id), job.to_json())
+        pipe.lpush(_KEY_QUEUE_PENDING, job_id)
+        pipe.sadd(_KEY_ALL_JOBS, job_id)
+        pipe.sadd(_KEY_STATUS_SET.format(status=JobStatus.PENDING.value), job_id)
+        pipe.hincrby(_KEY_META, "total_submitted", 1)
+        await pipe.execute()
 
         logger.info(f"Job submitted: {job_id} ({job_type})")
         return job
@@ -302,11 +297,22 @@ class RedisJobQueue:
         return False
 
     async def update_progress(self, job_id: str, progress: int) -> None:
-        """Update job progress (0-100)."""
+        """Update job progress (0-100) and publish event."""
         job = await self.get_job(job_id)
         if job and job.status == JobStatus.RUNNING:
+            old_progress = job.progress
             job.progress = min(max(progress, 0), 100)
             await self._save_job(job)
+
+            # Publish progress event for WebSocket subscribers
+            await self._publish_job_event(
+                job,
+                "progress",
+                {
+                    "old_progress": old_progress,
+                    "new_progress": job.progress,
+                },
+            )
 
     # -------------------------------------------------------------------------
     # Internal methods
@@ -323,13 +329,49 @@ class RedisJobQueue:
             await self._redis.expire(key, ttl_seconds)
 
     async def _transition_status(self, job: Job, new_status: JobStatus) -> None:
-        """Move job between status sets."""
+        """Move job between status sets atomically and publish event."""
         old_status = job.status
-        # Remove from old status set
-        await self._redis.srem(_KEY_STATUS_SET.format(status=old_status.value), job.id)
-        # Add to new status set
-        await self._redis.sadd(_KEY_STATUS_SET.format(status=new_status.value), job.id)
+
+        # Atomic status transition using pipeline
+        pipe = self._redis.pipeline()
+        pipe.srem(_KEY_STATUS_SET.format(status=old_status.value), job.id)
+        pipe.sadd(_KEY_STATUS_SET.format(status=new_status.value), job.id)
+        await pipe.execute()
+
         job.status = new_status
+
+        # Publish status change event for WebSocket subscribers
+        await self._publish_job_event(
+            job,
+            "status_changed",
+            {
+                "old_status": old_status.value,
+                "new_status": new_status.value,
+            },
+        )
+
+    async def _publish_job_event(
+        self,
+        job: Job,
+        event_type: str,
+        extra_data: dict[str, Any] | None = None,
+    ) -> None:
+        """Publish job event to Redis pub/sub channel."""
+        event = {
+            "event": event_type,
+            "job_id": job.id,
+            "status": job.status.value,
+            "progress": job.progress,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        if extra_data:
+            event.update(extra_data)
+
+        channel = _KEY_PUBSUB_JOB.format(job_id=job.id)
+        try:
+            await self._redis.publish(channel, json.dumps(event))
+        except Exception as e:
+            logger.debug(f"Failed to publish job event: {e}")
 
     async def _requeue_job(self, job_id: str) -> None:
         """Requeue a job back to pending state."""
@@ -438,6 +480,15 @@ class RedisJobQueue:
         job.completed_at = datetime.now(timezone.utc)
         await self._save_job(job)
         await self._redis.hincrby(_KEY_META, "total_completed", 1)
+
+        # Publish completion event with result summary
+        await self._publish_job_event(
+            job,
+            "completed",
+            {
+                "has_result": job.result is not None,
+            },
+        )
         logger.info(f"Job completed: {job.id}")
 
     async def _handle_failure(self, job: Job, error: Exception) -> None:
@@ -484,21 +535,37 @@ class RedisJobQueue:
     async def _cleanup_expired_references(self) -> None:
         """Remove references to jobs that have expired (TTL gone)."""
         all_ids = await self._redis.smembers(_KEY_ALL_JOBS)
-        removed = 0
+        if not all_ids:
+            return
 
-        for job_id in all_ids:
-            exists = await self._redis.exists(_KEY_JOB.format(job_id=job_id))
-            if not exists:
-                # Job expired via TTL, clean up set references
-                await self._redis.srem(_KEY_ALL_JOBS, job_id)
-                for status in JobStatus:
-                    await self._redis.srem(
-                        _KEY_STATUS_SET.format(status=status.value), job_id
-                    )
-                removed += 1
+        # Batch check which jobs still exist using pipeline
+        check_pipe = self._redis.pipeline()
+        job_ids_list = list(all_ids)
+        for job_id in job_ids_list:
+            check_pipe.exists(_KEY_JOB.format(job_id=job_id))
+        exists_results = await check_pipe.execute()
 
-        if removed:
-            logger.info(f"Cleaned up {removed} expired job references")
+        # Collect expired job IDs
+        expired_ids = [
+            job_id
+            for job_id, exists in zip(job_ids_list, exists_results, strict=False)
+            if not exists
+        ]
+
+        if not expired_ids:
+            return
+
+        # Batch remove expired references using pipeline
+        cleanup_pipe = self._redis.pipeline()
+        for job_id in expired_ids:
+            cleanup_pipe.srem(_KEY_ALL_JOBS, job_id)
+            for job_status in JobStatus:
+                cleanup_pipe.srem(
+                    _KEY_STATUS_SET.format(status=job_status.value), job_id
+                )
+        await cleanup_pipe.execute()
+
+        logger.info(f"Cleaned up {len(expired_ids)} expired job references")
 
 
 # Global job queue instance
@@ -575,3 +642,8 @@ async def cleanup_job_queue() -> None:
     if _job_queue:
         await _job_queue.stop()
         _job_queue = None
+
+
+def get_job_pubsub_channel(job_id: str) -> str:
+    """Get the Redis pub/sub channel name for a job's events."""
+    return _KEY_PUBSUB_JOB.format(job_id=job_id)

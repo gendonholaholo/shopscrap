@@ -184,6 +184,9 @@ class ShopeeScraper:
             List of ProductOutput instances
         """
         await self._ensure_started()
+        assert self._search_extractor is not None
+        assert self._product_extractor is not None
+        assert self._review_extractor is not None
 
         logger.info(f"Searching for: {keyword}")
 
@@ -221,7 +224,7 @@ class ShopeeScraper:
                     continue
 
                 # Get reviews
-                reviews_data = []
+                reviews_data: list[dict[str, Any]] = []
                 if max_reviews > 0:
                     try:
                         reviews_data = await self._review_extractor.get_reviews(
@@ -276,6 +279,8 @@ class ShopeeScraper:
             ProductOutput instance
         """
         await self._ensure_started()
+        assert self._product_extractor is not None
+        assert self._review_extractor is not None
 
         product_data = await self._product_extractor.get_product(
             shop_id=shop_id,
@@ -286,7 +291,7 @@ class ShopeeScraper:
             return {}
 
         # Get reviews
-        reviews_data = []
+        reviews_data: list[dict[str, Any]] = []
         if max_reviews > 0:
             try:
                 reviews_data = await self._review_extractor.get_reviews(
@@ -332,6 +337,7 @@ class ShopeeScraper:
             List of review dictionaries
         """
         await self._ensure_started()
+        assert self._review_extractor is not None
 
         reviews = await self._review_extractor.get_reviews(
             shop_id=shop_id,
@@ -362,6 +368,7 @@ class ShopeeScraper:
             Review summary dictionary
         """
         await self._ensure_started()
+        assert self._review_extractor is not None
 
         return await self._review_extractor.get_reviews_summary(
             shop_id=shop_id,

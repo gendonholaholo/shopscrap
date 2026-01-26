@@ -9,6 +9,7 @@ from urllib.parse import quote
 from shopee_scraper.extractors.base import BaseExtractor
 from shopee_scraper.utils.constants import BASE_URL, PRICE_DIVISOR
 from shopee_scraper.utils.logging import get_logger
+from shopee_scraper.utils.network_interceptor import NetworkInterceptor
 from shopee_scraper.utils.parsers import parse_price, parse_sold_count
 
 
@@ -17,14 +18,24 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+# Shopee search API endpoints to intercept
+SEARCH_API_PATTERNS = [
+    "/api/v4/search/search_items",
+    "/api/v4/recommend/recommend",
+    "/api/v4/search/search_hint",
+]
+
 
 class SearchExtractor(BaseExtractor):
     """
     Extract search results from Shopee.
 
-    Navigates to the actual search page and intercepts the API response
-    that Shopee's own JavaScript makes. This ensures all anti-bot tokens
-    are properly set by Shopee's code.
+    Uses a two-tier extraction strategy:
+    1. Primary: Network interception (CDP) - captures Shopee's internal API responses
+    2. Fallback: DOM extraction - parses page elements when API interception fails
+
+    Network interception is more reliable as API response structures change
+    less frequently than DOM selectors.
     """
 
     def __init__(self, browser: BrowserManager) -> None:
@@ -35,6 +46,7 @@ class SearchExtractor(BaseExtractor):
             browser: BrowserManager instance
         """
         self.browser = browser
+        self._use_network_interception = True  # Primary strategy
 
     async def search(
         self,
@@ -45,8 +57,9 @@ class SearchExtractor(BaseExtractor):
         """
         Search products by keyword.
 
-        Navigates to the Shopee search page and intercepts the internal
-        API response made by Shopee's own JavaScript.
+        Uses network interception (CDP) as primary strategy to capture
+        Shopee's internal API responses. Falls back to DOM extraction
+        if network interception fails.
 
         Args:
             keyword: Search keyword
@@ -61,6 +74,9 @@ class SearchExtractor(BaseExtractor):
             keyword=keyword,
             max_pages=max_pages,
             sort_by=sort_by,
+            strategy="network_interception"
+            if self._use_network_interception
+            else "dom",
         )
 
         all_products: list[dict[str, Any]] = []
@@ -75,12 +91,23 @@ class SearchExtractor(BaseExtractor):
         order_url = "asc" if sort_by == "price_asc" else "desc"
 
         page = await self.browser.new_page()
+        interceptor: NetworkInterceptor | None = None
 
         try:
+            # Setup network interception if enabled
+            if self._use_network_interception:
+                interceptor = NetworkInterceptor(page)
+                await interceptor.start(SEARCH_API_PATTERNS)
+                logger.debug("Network interception enabled")
+
             await self.browser.random_delay(1.0, 2.0)
 
             for page_num in range(max_pages):
                 logger.info(f"Scraping page {page_num + 1}/{max_pages}")
+
+                # Clear previous responses for new page
+                if interceptor:
+                    interceptor.clear_responses()
 
                 search_url = (
                     f"{BASE_URL}/search?keyword={quote(keyword)}"
@@ -101,28 +128,233 @@ class SearchExtractor(BaseExtractor):
                         )
                     break
 
-                # Wait for products to render and scroll to load all
-                await self.browser.scroll_page(page, scroll_count=5)
+                # Wait for page to load and API calls to complete
+                await self.browser.scroll_page(page, scroll_count=3)
                 await asyncio.sleep(2)
 
-                # Extract products from DOM
-                products = await self._extract_from_dom(page)
+                # Extraction strategy priority:
+                # 1. Network interception (CDP) - most reliable for API data
+                # 2. JavaScript global state (SSR hydration data)
+                # 3. DOM extraction - fallback for parsing page elements
+                products: list[dict[str, Any]] = []
+
+                # Strategy 1: Network interception
+                if interceptor:
+                    products = await self._extract_from_network(interceptor)
+
+                # Strategy 2: JavaScript global state (Shopee SSR hydration)
+                if not products:
+                    logger.debug("Trying JS global state extraction")
+                    products = await self._extract_from_js_state(page)
+
+                # Strategy 3: DOM extraction fallback
+                if not products:
+                    logger.debug("Falling back to DOM extraction")
+                    await self.browser.scroll_page(page, scroll_count=2)
+                    products = await self._extract_from_dom(page)
+
                 all_products.extend(products)
                 logger.info(
-                    f"Extracted {len(products)} products from page {page_num + 1}"
+                    f"Extracted {len(products)} products from page {page_num + 1}",
+                    method="network" if interceptor and products else "dom",
                 )
 
-                if len(products) < 60:
-                    logger.info("No more results, stopping pagination")
-                    break
+                if len(products) < 30:
+                    logger.info("Few results, may be last page")
+                    if len(products) == 0:
+                        break
 
                 await self.browser.random_delay(2.0, 4.0)
 
         finally:
+            if interceptor:
+                await interceptor.stop()
             await self.browser.close_page(page)
 
         logger.info(f"Search completed: {len(all_products)} total products")
         return all_products
+
+    async def _extract_from_network(
+        self,
+        interceptor: NetworkInterceptor,
+        timeout: float = 10.0,
+    ) -> list[dict[str, Any]]:
+        """
+        Extract products from intercepted API responses.
+
+        Args:
+            interceptor: Active NetworkInterceptor instance
+            timeout: Max wait time for API response
+
+        Returns:
+            List of parsed products
+        """
+        # Wait for search API response
+        response = await interceptor.wait_for_response(
+            "/api/v4/search/search_items",
+            timeout=timeout,
+        )
+
+        if not response or not response.body_json:
+            logger.debug("No search API response intercepted")
+            return []
+
+        # Parse API response
+        products = self._parse_api_response(response.body_json)
+        logger.debug(
+            f"Network interception extracted {len(products)} products",
+            api_url=response.url[:60] if response.url else "",
+        )
+        return products
+
+    async def _extract_from_js_state(self, page: Page) -> list[dict[str, Any]]:
+        """
+        Extract products from Shopee's JavaScript global state (SSR hydration).
+
+        Shopee uses SSR and stores data in global JS variables like:
+        - window.__INITIAL_STATE__
+        - window.__APOLLO_STATE__
+        - window.__remixContext
+        - Script tags with type="application/json"
+
+        Args:
+            page: nodriver Page instance
+
+        Returns:
+            List of parsed products
+        """
+        import json as _json
+
+        # JavaScript to extract data from various Shopee hydration sources
+        raw_data = await page.evaluate("""
+            (() => {
+                const products = [];
+
+                // Try __INITIAL_STATE__ (Next.js/Nuxt pattern)
+                if (window.__INITIAL_STATE__) {
+                    try {
+                        const state = window.__INITIAL_STATE__;
+                        // Search results often in search, items, or products key
+                        const searchData = state.search || state.searchResults ||
+                                          state.items || state.products || {};
+                        const items = searchData.items || searchData.products ||
+                                     searchData.data?.items || [];
+                        if (items.length > 0) {
+                            return JSON.stringify({source: '__INITIAL_STATE__', items: items});
+                        }
+                    } catch(e) {}
+                }
+
+                // Try __APOLLO_STATE__ (Apollo GraphQL cache)
+                if (window.__APOLLO_STATE__) {
+                    try {
+                        const apollo = window.__APOLLO_STATE__;
+                        const keys = Object.keys(apollo);
+                        for (const key of keys) {
+                            if (key.includes('search') || key.includes('Item')) {
+                                const data = apollo[key];
+                                if (data && data.items) {
+                                    return JSON.stringify({source: '__APOLLO_STATE__', items: data.items});
+                                }
+                            }
+                        }
+                    } catch(e) {}
+                }
+
+                // Try __remixContext (Remix pattern)
+                if (window.__remixContext) {
+                    try {
+                        const ctx = window.__remixContext;
+                        const loaderData = ctx.state?.loaderData || {};
+                        for (const key of Object.keys(loaderData)) {
+                            const data = loaderData[key];
+                            if (data?.items || data?.products) {
+                                return JSON.stringify({
+                                    source: '__remixContext',
+                                    items: data.items || data.products
+                                });
+                            }
+                        }
+                    } catch(e) {}
+                }
+
+                // Try script[type="application/json"] or script[id*="__NEXT_DATA__"]
+                const scripts = document.querySelectorAll(
+                    'script[type="application/json"], script[id*="__NEXT_DATA__"], script[id*="__NUXT__"]'
+                );
+                for (const script of scripts) {
+                    try {
+                        const data = JSON.parse(script.textContent);
+                        const items = data.props?.pageProps?.items ||
+                                     data.props?.pageProps?.searchResult?.items ||
+                                     data.data?.items ||
+                                     data.state?.search?.items ||
+                                     data.items ||
+                                     [];
+                        if (items.length > 0) {
+                            return JSON.stringify({source: 'script_json', items: items});
+                        }
+                    } catch(e) {}
+                }
+
+                // Try window.pageData (Shopee specific)
+                if (window.pageData) {
+                    try {
+                        const items = window.pageData.items ||
+                                     window.pageData.searchItems ||
+                                     window.pageData.products || [];
+                        if (items.length > 0) {
+                            return JSON.stringify({source: 'pageData', items: items});
+                        }
+                    } catch(e) {}
+                }
+
+                // Last resort: scan all window properties for search data
+                try {
+                    for (const key of Object.keys(window)) {
+                        if (key.startsWith('__') && typeof window[key] === 'object') {
+                            const obj = window[key];
+                            if (obj && obj.search && obj.search.items) {
+                                return JSON.stringify({source: key, items: obj.search.items});
+                            }
+                        }
+                    }
+                } catch(e) {}
+
+                return JSON.stringify({source: null, items: []});
+            })()
+        """)
+
+        if not raw_data:
+            return []
+
+        try:
+            parsed = _json.loads(raw_data) if isinstance(raw_data, str) else raw_data
+
+            source = parsed.get("source")
+            items = parsed.get("items", [])
+
+            if not items:
+                logger.debug("No products found in JS global state")
+                return []
+
+            logger.debug(f"JS state extraction found {len(items)} items", source=source)
+
+            # Parse items using existing API parser
+            products = []
+            for item in items:
+                # Handle both nested (item_basic) and flat structures
+                item_data = item.get("item_basic", item)
+                product = self.parse(item_data)
+                if product:
+                    products.append(product)
+
+            logger.debug(f"JS state extraction parsed {len(products)} products")
+            return products
+
+        except _json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse JS state data: {e}")
+            return []
 
     async def _navigate_with_retry(
         self, page: Page, url: str, max_retries: int = 3
@@ -182,55 +414,125 @@ class SearchExtractor(BaseExtractor):
         # Use JavaScript to extract all product data at once
         raw_products = await page.evaluate("""
             (() => {
-                const selectors = [
+                // Extended list of selectors - Shopee changes these frequently
+                const containerSelectors = [
+                    // Primary selectors
                     "[data-sqe='item']",
                     ".shopee-search-item-result__item",
+                    // Card-based selectors
+                    "[class*='product-card']",
+                    "[class*='productCard']",
+                    "[class*='ProductCard']",
                     "[class*='product-item']",
-                    "li[class*='col-xs']"
+                    "[class*='productItem']",
+                    // Grid-based selectors
+                    "li[class*='col-xs']",
+                    "[class*='grid'] > div[class*='item']",
+                    "[class*='grid'] > a",
+                    // Generic item containers
+                    "[class*='search-item']",
+                    "[class*='searchItem']",
+                    "a[href*='-i.'][href*='.']",  // Direct link matching
                 ];
 
                 let items = [];
-                for (const sel of selectors) {
-                    items = document.querySelectorAll(sel);
-                    if (items.length > 0) break;
+
+                // Try each selector
+                for (const sel of containerSelectors) {
+                    try {
+                        items = document.querySelectorAll(sel);
+                        if (items.length > 0) {
+                            console.log('Found items with selector:', sel, 'count:', items.length);
+                            break;
+                        }
+                    } catch(e) {}
+                }
+
+                // Fallback: find all links matching Shopee product URL pattern
+                if (items.length === 0) {
+                    const allLinks = document.querySelectorAll('a[href]');
+                    const productLinks = [];
+                    allLinks.forEach(a => {
+                        const href = a.getAttribute('href') || '';
+                        if (href.match(/-i\\.\\d+\\.\\d+/) && !productLinks.some(p => p.href === href)) {
+                            productLinks.push(a);
+                        }
+                    });
+                    items = productLinks;
+                    console.log('Fallback: found product links:', items.length);
                 }
 
                 const products = [];
+                const seenIds = new Set();
+
                 items.forEach(item => {
                     try {
-                        // Get product link
-                        const links = item.querySelectorAll('a');
+                        // Get product link - search in item or item itself is link
                         let href = '';
-                        for (const l of links) {
-                            const h = l.getAttribute('href') || '';
-                            if (h.match(/i\\.\\d+\\.\\d+/)) { href = h; break; }
+                        if (item.tagName === 'A') {
+                            href = item.getAttribute('href') || '';
+                        } else {
+                            const links = item.querySelectorAll('a');
+                            for (const l of links) {
+                                const h = l.getAttribute('href') || '';
+                                if (h.match(/-i\\.\\d+\\.\\d+/)) { href = h; break; }
+                            }
                         }
-                        const match = href.match(/i\\.(\\d+)\\.(\\d+)/);
+
+                        // Extract shop_id and item_id from URL
+                        const match = href.match(/-i\\.(\\d+)\\.(\\d+)/);
                         if (!match) return;
 
+                        const itemId = match[2];
+                        if (seenIds.has(itemId)) return;  // Skip duplicates
+                        seenIds.add(itemId);
+
                         // Extract name from URL slug (most reliable)
-                        const slug = href.split('-i.')[0].replace(/^\\//,'');
-                        const nameFromSlug = slug.replace(/-/g, ' ');
+                        const slug = href.split('-i.')[0].replace(/^\\//, '');
+                        const nameFromSlug = slug.replace(/-/g, ' ').trim();
 
                         // Try DOM-based name extraction
-                        const allText = item.innerText || '';
-                        const lines = allText.split('\\n').filter(l => l.trim().length > 5);
+                        const allText = (item.innerText || '').trim();
+                        const lines = allText.split('\\n').map(l => l.trim()).filter(l => l.length > 3);
                         const nameFromDom = lines[0] || '';
 
-                        // Price: find text matching Rp pattern
+                        // Price: find text matching Rp pattern (multiple formats)
                         let priceText = '0';
-                        const priceMatch = allText.match(/Rp[\\s.]?([\\d.,]+)/);
-                        if (priceMatch) priceText = priceMatch[0];
+                        const pricePatterns = [
+                            /Rp\\s*([\\d.,]+)/,
+                            /([\\d.,]+)\\s*rb/i,
+                            /IDR\\s*([\\d.,]+)/i,
+                        ];
+                        for (const pattern of pricePatterns) {
+                            const priceMatch = allText.match(pattern);
+                            if (priceMatch) {
+                                priceText = priceMatch[0];
+                                break;
+                            }
+                        }
 
-                        // Sold: find "terjual" or number+sold pattern
+                        // Sold: find "terjual" patterns
                         let soldText = '0';
-                        const soldMatch = allText.match(/(\\d[\\d.,]*[rRbBjJ]*)\\s*((?:RB|rb|Rb)\\+?)?\\s*[Tt]erjual/i)
-                            || allText.match(/[Tt]erjual\\s*(\\d[\\d.,]*[rRbBjJ]*)/i);
-                        if (soldMatch) soldText = soldMatch[0];
+                        const soldPatterns = [
+                            /(\\d[\\d.,]*\\s*(?:rb|RB|Rb|k|K)?\\+?)\\s*[Tt]erjual/i,
+                            /[Tt]erjual\\s*(\\d[\\d.,]*\\s*(?:rb|RB|Rb|k|K)?\\+?)/i,
+                            /(\\d[\\d.,]*\\s*(?:rb|RB|k|K)?)\\+?\\s*sold/i,
+                        ];
+                        for (const pattern of soldPatterns) {
+                            const soldMatch = allText.match(pattern);
+                            if (soldMatch) {
+                                soldText = soldMatch[0];
+                                break;
+                            }
+                        }
 
-                        // Get image
+                        // Get image - try multiple sources
+                        let image = '';
                         const imgEl = item.querySelector('img');
-                        const image = imgEl ? (imgEl.src || imgEl.getAttribute('src') || '') : '';
+                        if (imgEl) {
+                            image = imgEl.src || imgEl.getAttribute('src') ||
+                                   imgEl.getAttribute('data-src') || '';
+                        }
 
                         products.push({
                             shop_id: parseInt(match[1]),
@@ -241,9 +543,21 @@ class SearchExtractor(BaseExtractor):
                             image: image,
                             href: href
                         });
-                    } catch(e) {}
+                    } catch(e) {
+                        console.error('Error extracting product:', e);
+                    }
                 });
-                return JSON.stringify(products);
+
+                // Debug info
+                console.log('Extracted products:', products.length);
+                return JSON.stringify({
+                    debug: {
+                        url: window.location.href,
+                        totalItems: items.length,
+                        extractedProducts: products.length
+                    },
+                    products: products
+                });
             })()
         """)
 
@@ -255,10 +569,28 @@ class SearchExtractor(BaseExtractor):
             try:
                 raw_products = _json.loads(raw_products)
             except _json.JSONDecodeError:
-                raw_products = []
+                raw_products = {"debug": {}, "products": []}
+
+        # Extract debug info and products from new structure
+        debug_info = (
+            raw_products.get("debug", {}) if isinstance(raw_products, dict) else {}
+        )
+        raw_items = (
+            raw_products.get("products", [])
+            if isinstance(raw_products, dict)
+            else raw_products
+        )
+
+        if debug_info:
+            logger.debug(
+                "DOM extraction debug",
+                url=debug_info.get("url", "")[:60],
+                total_items=debug_info.get("totalItems", 0),
+                extracted=debug_info.get("extractedProducts", 0),
+            )
 
         products = []
-        for raw in raw_products or []:
+        for raw in raw_items or []:
             try:
                 products.append(
                     {

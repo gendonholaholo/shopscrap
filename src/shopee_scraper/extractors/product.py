@@ -7,31 +7,35 @@ import re
 from typing import TYPE_CHECKING, Any
 
 from shopee_scraper.extractors.base import BaseExtractor
-from shopee_scraper.utils.constants import (
-    BASE_URL,
-    ITEM_API,
-    PRICE_DIVISOR,
-    PRODUCT_API,
-)
+from shopee_scraper.utils.constants import BASE_URL, PRICE_DIVISOR
 from shopee_scraper.utils.logging import get_logger
+from shopee_scraper.utils.network_interceptor import NetworkInterceptor
 
 
 if TYPE_CHECKING:
     from shopee_scraper.core.browser import BrowserManager, Page
 
-# Type alias for nodriver response (placeholder for product extractor refactoring)
-Response = object
-
 logger = get_logger(__name__)
+
+# Shopee product API endpoints to intercept
+PRODUCT_API_PATTERNS = [
+    "/api/v4/pdp/get_pc",
+    "/api/v4/item/get",
+]
 
 
 class ProductExtractor(BaseExtractor):
     """
     Extract product details from Shopee.
 
-    Uses Shopee's internal API v4:
-    - /api/v4/pdp/get_pc - Product detail for PC/web
-    - /api/v4/item/get - Alternative endpoint
+    Uses a two-tier extraction strategy:
+    1. Primary: Network interception (CDP) - captures Shopee's internal API responses
+       - /api/v4/pdp/get_pc - Product detail for PC/web
+       - /api/v4/item/get - Alternative endpoint
+    2. Fallback: DOM extraction - parses page elements when API interception fails
+
+    Network interception is more reliable as API response structures change
+    less frequently than DOM selectors.
     """
 
     def __init__(self, browser: BrowserManager) -> None:
@@ -43,6 +47,7 @@ class ProductExtractor(BaseExtractor):
         """
         self.browser = browser
         self._intercepted_data: dict[str, Any] = {}
+        self._use_network_interception = True  # Primary strategy
 
     async def get_product(
         self,
@@ -52,7 +57,9 @@ class ProductExtractor(BaseExtractor):
         """
         Get product detail by shop_id and item_id.
 
-        Uses DOM extraction since nodriver doesn't support response interception.
+        Uses network interception (CDP) as primary strategy to capture
+        Shopee's internal API responses. Falls back to DOM extraction
+        if network interception fails.
 
         Args:
             shop_id: Shop ID
@@ -61,28 +68,108 @@ class ProductExtractor(BaseExtractor):
         Returns:
             Product detail dictionary
         """
-        logger.info("Getting product detail", shop_id=shop_id, item_id=item_id)
+        logger.info(
+            "Getting product detail",
+            shop_id=shop_id,
+            item_id=item_id,
+            strategy="network_interception"
+            if self._use_network_interception
+            else "dom",
+        )
 
         page = await self.browser.new_page()
+        interceptor: NetworkInterceptor | None = None
 
         try:
+            # Setup network interception if enabled
+            if self._use_network_interception:
+                interceptor = NetworkInterceptor(page)
+                await interceptor.start(PRODUCT_API_PATTERNS)
+                logger.debug("Network interception enabled for product")
+
             # Build product URL
             product_url = f"{BASE_URL}/product/{shop_id}/{item_id}"
 
             # Navigate to product page
             await self.browser.goto(page, product_url)
 
-            # Scroll to load all content
-            await self.browser.scroll_page(page, scroll_count=3)
+            # Scroll to load content and trigger API calls
+            await self.browser.scroll_page(page, scroll_count=2)
 
             # Wait for page to fully load
             await self.browser.random_delay(2.0, 3.0)
 
-            # Extract from DOM using JavaScript
-            return await self._extract_from_dom(page, shop_id, item_id)
+            # Try network interception first (more reliable)
+            product: dict[str, Any] = {}
+            if interceptor:
+                product = await self._extract_from_network(
+                    interceptor, shop_id, item_id
+                )
+
+            # Fallback to DOM extraction if network interception found nothing
+            if not product:
+                logger.debug("Falling back to DOM extraction for product")
+                product = await self._extract_from_dom(page, shop_id, item_id)
+
+            return product
 
         finally:
+            if interceptor:
+                await interceptor.stop()
             await self.browser.close_page(page)
+
+    async def _extract_from_network(
+        self,
+        interceptor: NetworkInterceptor,
+        shop_id: int,
+        item_id: int,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        """
+        Extract product from intercepted API responses.
+
+        Args:
+            interceptor: Active NetworkInterceptor instance
+            shop_id: Shop ID for the product
+            item_id: Item ID for the product
+            timeout: Max wait time for API response
+
+        Returns:
+            Parsed product dictionary or empty dict
+        """
+        # Try pdp/get_pc first (primary endpoint)
+        response = await interceptor.wait_for_response(
+            "/api/v4/pdp/get_pc",
+            timeout=timeout,
+        )
+
+        if not response or not response.body_json:
+            # Try alternative endpoint
+            response = await interceptor.wait_for_response(
+                "/api/v4/item/get",
+                timeout=5.0,
+            )
+
+        if not response or not response.body_json:
+            logger.debug("No product API response intercepted")
+            return {}
+
+        # Parse API response
+        data = response.body_json
+        if data.get("error"):
+            logger.warning("API returned error", error=data.get("error_msg", ""))
+            return {}
+
+        # Parse the structured data
+        product = self.parse(data.get("data", data))
+
+        if product:
+            logger.debug(
+                "Network interception extracted product",
+                item_id=item_id,
+                name=product.get("name", "")[:30],
+            )
+        return product
 
     async def get_products_batch(
         self,
@@ -118,24 +205,6 @@ class ProductExtractor(BaseExtractor):
 
         logger.info(f"Batch completed: {len(products)}/{len(items)} products")
         return products
-
-    async def _handle_response(self, response: Response) -> None:
-        """Handle intercepted API responses."""
-        url = response.url
-
-        if (PRODUCT_API in url or ITEM_API in url) and response.status == 200:
-            try:
-                data = await response.json()
-                # Merge data from different endpoints
-                if "data" in data:
-                    self._intercepted_data.update(data.get("data", {}))
-                elif "item" in data:
-                    self._intercepted_data.update(data.get("item", {}))
-                else:
-                    self._intercepted_data.update(data)
-                logger.debug("Intercepted product API response")
-            except Exception as e:
-                logger.warning(f"Failed to parse API response: {e}")
 
     async def _extract_from_dom(
         self,

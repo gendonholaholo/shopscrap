@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import nodriver
 
@@ -13,10 +13,15 @@ from shopee_scraper.utils.logging import get_logger
 from shopee_scraper.utils.proxy import ProxyConfig, ProxyPool
 
 
-logger = get_logger(__name__)
+if TYPE_CHECKING:
+    from nodriver import Tab as Page
+else:
+    Page = nodriver.Tab
 
-# Type alias for nodriver tab (used as "page" in other modules)
-Page = nodriver.Tab
+# Export Page for other modules
+__all__ = ["BrowserManager", "Page"]
+
+logger = get_logger(__name__)
 
 
 class BrowserManager:
@@ -46,13 +51,15 @@ class BrowserManager:
 
         self._browser: nodriver.Browser | None = None
         self._pages: list[Page] = []
+        self._current_proxy: ProxyConfig | None = None
 
     async def start(self) -> None:
         """Start Chrome browser via nodriver."""
         logger.info(
             "Starting Chrome browser",
             headless=self.headless,
-            has_proxy=self.proxy is not None,
+            has_proxy=self.proxy is not None
+            or (self.proxy_pool and not self.proxy_pool.is_empty),
         )
 
         user_data = self.user_data_dir or "./data/chrome_profile"
@@ -62,20 +69,32 @@ class BrowserManager:
         browser_args = [
             "--no-first-run",
             "--no-default-browser-check",
+            # Required for Docker/containerized environments
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
         ]
 
-        # Proxy support
-        proxy_server = None
+        # Get proxy configuration
+        current_proxy = None
         if self.proxy:
-            proxy_server = self.proxy.to_url()
+            current_proxy = self.proxy
         elif self.proxy_pool and not self.proxy_pool.is_empty:
             current_proxy = self.proxy_pool.get_next()
             if current_proxy:
-                proxy_server = current_proxy.to_url()
                 logger.info("Using proxy from pool", host=current_proxy.host)
 
-        if proxy_server:
+        # For authenticated proxies, we use --proxy-server without credentials
+        # and handle authentication via CDP Fetch.authRequired
+        if current_proxy:
+            # Use proxy server without credentials in URL
+            proxy_server = (
+                f"{current_proxy.protocol}://{current_proxy.host}:{current_proxy.port}"
+            )
             browser_args.append(f"--proxy-server={proxy_server}")
+            self._current_proxy = current_proxy
+        else:
+            self._current_proxy = None
 
         self._browser = await nodriver.start(
             headless=self.headless,
@@ -84,7 +103,52 @@ class BrowserManager:
             lang="id-ID",
         )
 
+        # Setup proxy authentication handler if we have credentials
+        if current_proxy and current_proxy.username and current_proxy.password:
+            await self._setup_proxy_auth(current_proxy)
+
         logger.info("Browser started successfully")
+
+    async def _setup_proxy_auth(self, proxy: ProxyConfig) -> None:
+        """Setup proxy authentication using CDP Fetch domain."""
+        from nodriver.cdp import fetch
+
+        if self._browser is None:
+            return
+
+        tab = self._browser.main_tab
+
+        # Enable Fetch with auth required handling
+        await tab.send(fetch.enable(handle_auth_requests=True))
+
+        # Add handler for auth challenges
+        async def handle_auth_required(event: fetch.AuthRequired) -> None:
+            """Handle 407 Proxy Authentication Required."""
+            logger.debug(
+                "Proxy auth required",
+                request_id=event.request_id,
+                host=proxy.host,
+            )
+            await tab.send(
+                fetch.continue_with_auth(
+                    request_id=event.request_id,
+                    auth_challenge_response=fetch.AuthChallengeResponse(
+                        response="ProvideCredentials",
+                        username=proxy.username,
+                        password=proxy.password,
+                    ),
+                )
+            )
+
+        # Add handler for continuing requests after auth
+        async def handle_request_paused(event: fetch.RequestPaused) -> None:
+            """Continue paused requests."""
+            await tab.send(fetch.continue_request(request_id=event.request_id))
+
+        tab.add_handler(fetch.AuthRequired, handle_auth_required)
+        tab.add_handler(fetch.RequestPaused, handle_request_paused)
+
+        logger.info("Proxy authentication handler configured")
 
     async def new_page(self) -> Page:
         """Create a new tab in the browser."""

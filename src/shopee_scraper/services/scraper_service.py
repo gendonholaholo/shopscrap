@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from shopee_scraper.core.scraper import ShopeeScraper
 from shopee_scraper.models.output import ProductOutput, _dataclass_to_dict
+from shopee_scraper.utils.config import get_settings
 from shopee_scraper.utils.health_checker import HealthChecker
 from shopee_scraper.utils.logging import get_logger
+from shopee_scraper.utils.proxy import ProxyConfig, ProxyPool
 from shopee_scraper.utils.system_monitor import get_uptime
 from shopee_scraper.utils.transformer import create_export
 
+
+if TYPE_CHECKING:
+    from shopee_scraper.services.cache import ProductCache, ReviewCache
 
 logger = get_logger(__name__)
 
@@ -21,6 +26,9 @@ class ScraperService:
 
     This provides a clean interface for external communication layers
     while keeping business logic centralized.
+
+    Supports optional caching via ProductCache and ReviewCache for
+    improved performance and reduced scraping load.
     """
 
     def __init__(
@@ -33,13 +41,63 @@ class ScraperService:
         self._output_dir = output_dir
         self._scraper: ShopeeScraper | None = None
         self._health_checker = HealthChecker(data_dir="./data")
+        self._product_cache: ProductCache | None = None
+        self._review_cache: ReviewCache | None = None
+
+    def set_caches(
+        self,
+        product_cache: ProductCache | None = None,
+        review_cache: ReviewCache | None = None,
+    ) -> None:
+        """
+        Set cache instances for the service.
+
+        Args:
+            product_cache: Optional ProductCache for caching product data
+            review_cache: Optional ReviewCache for caching review data
+        """
+        self._product_cache = product_cache
+        self._review_cache = review_cache
+        if product_cache:
+            logger.info("Product caching enabled")
+        if review_cache:
+            logger.info("Review caching enabled")
 
     async def _get_scraper(self) -> ShopeeScraper:
-        """Get or create scraper instance."""
+        """Get or create scraper instance with proxy and captcha settings."""
         if self._scraper is None:
+            settings = get_settings()
+
+            # Setup proxy pool if enabled
+            proxy_pool = None
+            if settings.proxy.enabled and settings.proxy.host:
+                proxy_config = ProxyConfig(
+                    host=settings.proxy.host,
+                    port=settings.proxy.port,
+                    username=settings.proxy.username,
+                    password=settings.proxy.password,
+                )
+                proxy_pool = ProxyPool([proxy_config])
+                logger.info(
+                    "Proxy enabled",
+                    host=settings.proxy.host,
+                    port=settings.proxy.port,
+                )
+
+            # Setup captcha solver if enabled
+            use_anticaptcha = settings.captcha.enabled
+            captcha_api_key = settings.captcha.api_key if use_anticaptcha else None
+            if use_anticaptcha:
+                logger.info(
+                    "CAPTCHA auto-solver enabled", provider=settings.captcha.provider
+                )
+
             self._scraper = ShopeeScraper(
                 headless=self._headless,
+                proxy_pool=proxy_pool,
                 output_dir=self._output_dir,
+                use_anticaptcha=use_anticaptcha,
+                twocaptcha_api_key=captcha_api_key,
             )
             await self._scraper.start()
         return self._scraper
@@ -95,8 +153,29 @@ class ScraperService:
         item_id: int,
         max_reviews: int = 5,
         save: bool = False,
+        use_cache: bool = True,
     ) -> dict[str, Any] | None:
-        """Get product detail by shop_id and item_id."""
+        """
+        Get product detail by shop_id and item_id.
+
+        Args:
+            shop_id: Shopee shop ID
+            item_id: Shopee item ID
+            max_reviews: Maximum reviews to fetch
+            save: Whether to save to file
+            use_cache: Whether to use cache (if available)
+
+        Returns:
+            Product data dict or None if not found
+        """
+        # Try cache first if enabled
+        if use_cache and self._product_cache:
+            cached = await self._product_cache.get(shop_id, item_id)
+            if cached:
+                logger.info(f"Service: cache hit for product {shop_id}/{item_id}")
+                return cached
+
+        # Fetch from scraper
         scraper = await self._get_scraper()
         logger.info(f"Service: getting product {shop_id}/{item_id}")
 
@@ -110,11 +189,17 @@ class ScraperService:
         if not product:
             return None
 
-        # If it's a ProductOutput, convert to dict
+        # Convert to dict
         if isinstance(product, ProductOutput):
-            return _dataclass_to_dict(product)
+            result = _dataclass_to_dict(product)
+        else:
+            result = product
 
-        return product
+        # Cache the result if caching enabled
+        if use_cache and self._product_cache and result:
+            await self._product_cache.set(shop_id, item_id, result)
+
+        return result
 
     async def get_products_batch(
         self,

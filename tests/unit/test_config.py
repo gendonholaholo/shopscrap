@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from shopee_scraper.utils.config import (
     AuthSettings,
     CORSSettings,
@@ -9,12 +11,28 @@ from shopee_scraper.utils.config import (
 )
 
 
+@pytest.fixture(autouse=True)
+def clear_env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear environment variables that could affect config tests."""
+    # Clear rate limit vars
+    monkeypatch.delenv("RATE_LIMIT_ENABLED", raising=False)
+    monkeypatch.delenv("RATE_LIMIT_STORAGE", raising=False)
+    monkeypatch.delenv("RATE_LIMIT_REDIS_URL", raising=False)
+    # Clear auth vars
+    monkeypatch.delenv("API_AUTH_ENABLED", raising=False)
+    monkeypatch.delenv("API_KEYS", raising=False)
+    monkeypatch.delenv("API_KEY_HEADER_NAME", raising=False)
+    # Clear CORS vars
+    monkeypatch.delenv("CORS_ENABLED", raising=False)
+    monkeypatch.delenv("CORS_ALLOW_ORIGINS", raising=False)
+
+
 class TestRateLimitSettings:
     """Tests for RateLimitSettings class."""
 
     def test_default_values(self) -> None:
-        """Test default configuration values."""
-        settings = RateLimitSettings()
+        """Test default configuration values (without .env influence)."""
+        settings = RateLimitSettings(_env_file=None)  # type: ignore[call-arg]
 
         assert settings.enabled is False
         assert settings.requests_per_minute == 60
@@ -23,8 +41,8 @@ class TestRateLimitSettings:
         assert settings.storage == "memory"
 
     def test_redis_url_default(self) -> None:
-        """Test default Redis URL."""
-        settings = RateLimitSettings()
+        """Test default Redis URL (without .env influence)."""
+        settings = RateLimitSettings(_env_file=None)  # type: ignore[call-arg]
         assert settings.redis_url == "redis://localhost:6379"
 
 
@@ -72,8 +90,8 @@ class TestAuthSettings:
     """Tests for AuthSettings class."""
 
     def test_default_values(self) -> None:
-        """Test default auth values."""
-        settings = AuthSettings()
+        """Test default auth values (without .env influence)."""
+        settings = AuthSettings(_env_file=None)  # type: ignore[call-arg]
 
         assert settings.auth_enabled is False
         assert settings.keys == ""

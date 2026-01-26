@@ -33,9 +33,9 @@ RUN /app/.venv/bin/python -m camoufox fetch
 # Stage 2: Runtime
 FROM python:3.11-slim AS runtime
 
-# Install system dependencies for Camoufox (Firefox)
+# Install system dependencies for browsers
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # Firefox dependencies
+    # Firefox/Camoufox dependencies
     libgtk-3-0 \
     libdbus-glib-1-2 \
     libxt6 \
@@ -49,14 +49,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxfixes3 \
     libpango-1.0-0 \
     libcairo2 \
+    # Chrome dependencies
+    libnss3 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libdrm2 \
+    libxkbcommon0 \
+    libgbm1 \
     # Virtual display for headless
     xvfb \
     # Utilities
     curl \
+    wget \
+    gnupg \
     ca-certificates \
     fonts-liberation \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
+
+# Install Chromium (works on both amd64 and arm64)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends chromium \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean \
+    && ln -sf /usr/bin/chromium /usr/bin/google-chrome
 
 # Create non-root user with home directory
 RUN groupadd -r scraper && useradd -r -g scraper -m -d /home/scraper scraper

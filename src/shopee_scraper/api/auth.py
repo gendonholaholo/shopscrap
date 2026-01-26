@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
+from typing import Any
 
 from fastapi import HTTPException, Security, status
 from fastapi.security import APIKeyHeader, APIKeyQuery
@@ -170,7 +171,7 @@ async def optional_api_key(
     return api_key
 
 
-def require_api_key():
+def require_api_key() -> Any:
     """
     Dependency that requires valid API key.
 

@@ -62,6 +62,37 @@ def get_uploaded_cookies_path() -> Path:
     return get_session_dir() / "uploaded_cookies.json"
 
 
+def get_cli_cookies_path(session_name: str = "default") -> Path:
+    """Get path for CLI-saved cookies file."""
+    return get_session_dir() / f"{session_name}_cookies.json"
+
+
+def get_active_cookies_path() -> Path:
+    """
+    Get the path to active cookies file.
+
+    Priority:
+    1. uploaded_cookies.json (from browser extension)
+    2. default_cookies.json (from CLI login)
+    """
+    uploaded_path = get_uploaded_cookies_path()
+    cli_path = get_cli_cookies_path()
+
+    # Check which file exists and is newer
+    if uploaded_path.exists() and cli_path.exists():
+        # Return the newer one
+        if uploaded_path.stat().st_mtime > cli_path.stat().st_mtime:
+            return uploaded_path
+        return cli_path
+    elif uploaded_path.exists():
+        return uploaded_path
+    elif cli_path.exists():
+        return cli_path
+
+    # Return uploaded path as default (will trigger "not found" response)
+    return uploaded_path
+
+
 # =============================================================================
 # Endpoints
 # =============================================================================
@@ -164,11 +195,11 @@ async def get_cookie_status(
     Check cookie status.
 
     Returns information about:
-    - Whether cookies exist
+    - Whether cookies exist (from browser extension OR CLI login)
     - Whether they are still valid (not expired)
     - Expiration date and days remaining
     """
-    cookies_path = get_uploaded_cookies_path()
+    cookies_path = get_active_cookies_path()
 
     # Check if file exists
     if not cookies_path.exists():
@@ -185,7 +216,14 @@ async def get_cookie_status(
         with cookies_path.open() as f:
             data = json.load(f)
 
-        uploaded_at_str = data.get("uploaded_at")
+        # Determine source
+        source = data.get("source", "cli_login")
+        if "uploaded" in cookies_path.name:
+            source = "browser_extension"
+        elif "saved_at" in data:
+            source = "cli_login"
+
+        uploaded_at_str = data.get("uploaded_at") or data.get("saved_at")
         expires_at_str = data.get("expires_at")
         cookies = data.get("cookies", [])
 
@@ -215,6 +253,7 @@ async def get_cookie_status(
                 data={
                     "has_session": True,
                     "valid": True,
+                    "source": source,
                     "cookies_count": len(cookies),
                     "uploaded_at": uploaded_at.isoformat() if uploaded_at else None,
                     "expires_at": expires_at.isoformat(),
@@ -227,6 +266,7 @@ async def get_cookie_status(
                 data={
                     "has_session": True,
                     "valid": False,
+                    "source": source,
                     "uploaded_at": uploaded_at.isoformat() if uploaded_at else None,
                     "expired_at": expires_at.isoformat(),
                     "message": "Session expired. Please re-login and upload new cookies.",
