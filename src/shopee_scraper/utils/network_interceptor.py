@@ -119,6 +119,22 @@ class NetworkInterceptor:
         # Store pending request for body retrieval
         self._pending_requests[request_id] = url
 
+        # Check if we already have a valid response with data for this URL
+        # Don't overwrite a good response with potentially error response from retry
+        existing = self._responses.get(url)
+        if existing and existing.body_json:
+            # Check if existing response has actual product data
+            has_items = (
+                "items" in existing.body_json
+                or ("data" in existing.body_json and "items" in existing.body_json.get("data", {}))
+            )
+            if has_items:
+                logger.debug(
+                    "Keeping existing valid response, skipping new capture",
+                    url=url[:60],
+                )
+                return
+
         # Create response object
         headers = {}
         if event.response.headers:

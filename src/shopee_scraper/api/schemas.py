@@ -271,7 +271,6 @@ class JobCreate(BaseModel):
     keyword: str = Field(..., min_length=1)
     max_products: int = Field(default=10, ge=1, le=100)
     include_reviews: bool = False
-    webhook_url: str | None = None
 
 
 class JobResponse(BaseModel):

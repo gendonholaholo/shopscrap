@@ -131,6 +131,23 @@ class SearchExtractor(BaseExtractor):
                         logger.error(
                             "Redirected to login - run 'shopee-scraper login' first."
                         )
+                        break
+
+                    # IMPORTANT: Try to extract from interceptor before giving up!
+                    # Shopee sends API response BEFORE redirecting to verify page.
+                    # The data might already be in the interceptor.
+                    if interceptor:
+                        logger.info(
+                            "Navigate blocked by verification, but checking interceptor for data..."
+                        )
+                        salvaged_products = await self._extract_from_network(
+                            interceptor, timeout=2.0
+                        )
+                        if salvaged_products:
+                            logger.info(
+                                f"Salvaged {len(salvaged_products)} products from interceptor despite verification block"
+                            )
+                            all_products.extend(salvaged_products)
                     break
 
                 # Wait for page to load and API calls to complete
@@ -418,6 +435,15 @@ class SearchExtractor(BaseExtractor):
         # Log response structure for debugging
         top_keys = list(data.keys()) if data else []
         logger.debug(f"API response keys: {top_keys}")
+
+        # Check for error response
+        if "error" in data:
+            error_val = data.get("error")
+            logger.warning(f"API response contains error: {error_val}")
+            # Log first 200 chars of response for debugging
+            import json
+            response_preview = json.dumps(data)[:200]
+            logger.debug(f"Error response preview: {response_preview}")
 
         items = data.get("items", [])
         if not items:

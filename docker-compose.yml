@@ -27,8 +27,8 @@ services:
       # CORS
       - CORS_ENABLED=true
       - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-*}
-      # Auth (set API_KEYS in .env file)
-      - API_AUTH_ENABLED=${API_AUTH_ENABLED:-false}
+      # Auth - ENABLED by default in production (set API_KEYS in .env file)
+      - API_AUTH_ENABLED=${API_AUTH_ENABLED:-true}
       - API_KEYS=${API_KEYS:-}
       # Proxy (Residential Proxy)
       - PROXY_ENABLED=${PROXY_ENABLED:-false}
