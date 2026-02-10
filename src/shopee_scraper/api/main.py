@@ -19,12 +19,17 @@ from shopee_scraper.api.dependencies import (
 from shopee_scraper.api.jobs import cleanup_job_queue, setup_job_queue
 from shopee_scraper.api.rate_limiter import setup_rate_limiter
 from shopee_scraper.api.routes import (
+    extension_router,
     health_router,
     jobs_router,
     products_router,
     reviews_router,
     session_router,
     websocket_router,
+)
+from shopee_scraper.extension.manager import (
+    cleanup_extension_manager,
+    init_extension_manager,
 )
 from shopee_scraper.utils.config import get_settings
 from shopee_scraper.utils.logging import get_logger
@@ -91,6 +96,16 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             scraper_service=scraper_service,
         )
         logger.info("Job queue initialized with Redis backend")
+
+        # Initialize Extension Manager
+        ext_settings = getattr(settings, "extension", None)
+        task_timeout = getattr(ext_settings, "task_timeout_seconds", 300)
+        hb_timeout = getattr(ext_settings, "heartbeat_timeout_seconds", 90)
+        await init_extension_manager(
+            task_timeout=task_timeout,
+            heartbeat_timeout=hb_timeout,
+        )
+        logger.info("Extension manager initialized")
     except Exception as e:
         logger.warning(f"Failed to initialize job queue: {e}")
 
@@ -98,6 +113,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
     # Shutdown
     logger.info("Shutting down Shopee Scraper API")
+    await cleanup_extension_manager()
     await cleanup_job_queue()
     await cleanup_redis()
     await cleanup_scraper_service()
@@ -218,6 +234,7 @@ Running in **{settings.env}** mode.
     app.include_router(reviews_router, prefix="/api/v1")
     app.include_router(jobs_router, prefix="/api/v1")
     app.include_router(websocket_router, prefix="/api/v1")  # WebSocket for real-time
+    app.include_router(extension_router, prefix="/api/v1")  # Chrome Extension gateway
     app.include_router(health_router)  # Health last
 
     return app
