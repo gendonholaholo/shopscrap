@@ -254,6 +254,31 @@ class CaptchaSettings(BaseSettings):
     max_retries: int = Field(default=3, description="Retry attempts for solving")
 
 
+class ExtensionSettings(BaseSettings):
+    """Chrome Extension backend configuration."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="EXTENSION_",
+        env_file=".env",
+        extra="ignore",
+    )
+
+    enabled: bool = Field(default=True, description="Enable Chrome Extension support")
+    task_timeout_seconds: int = Field(
+        default=300, description="Max time to wait for extension task result"
+    )
+    max_retries: int = Field(
+        default=2, description="Max retry attempts for failed extension tasks"
+    )
+    heartbeat_interval_seconds: int = Field(
+        default=30, description="Expected heartbeat interval from extension"
+    )
+    heartbeat_timeout_seconds: int = Field(
+        default=90,
+        description="Mark extension dead after this many seconds without heartbeat",
+    )
+
+
 class Settings(BaseSettings):
     """Main application settings."""
 
@@ -274,6 +299,7 @@ class Settings(BaseSettings):
     job_queue: JobQueueSettings = Field(default_factory=JobQueueSettings)
     cache: CacheSettings = Field(default_factory=CacheSettings)
     captcha: CaptchaSettings = Field(default_factory=CaptchaSettings)
+    extension: ExtensionSettings = Field(default_factory=ExtensionSettings)
     output_dir: Path = Path("./data/output")
     log_level: str = "INFO"
 

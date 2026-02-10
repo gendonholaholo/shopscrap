@@ -98,12 +98,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         logger.info("Job queue initialized with Redis backend")
 
         # Initialize Extension Manager
-        ext_settings = getattr(settings, "extension", None)
-        task_timeout = getattr(ext_settings, "task_timeout_seconds", 300)
-        hb_timeout = getattr(ext_settings, "heartbeat_timeout_seconds", 90)
         await init_extension_manager(
-            task_timeout=task_timeout,
-            heartbeat_timeout=hb_timeout,
+            task_timeout=settings.extension.task_timeout_seconds,
+            heartbeat_timeout=settings.extension.heartbeat_timeout_seconds,
         )
         logger.info("Extension manager initialized")
     except Exception as e:
