@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Shopee Scraper</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <h1>Shopee Scraper</h1>
+
+    <div class="status-section">
+      <div class="status-row">
+        <span class="status-dot" id="statusDot"></span>
+        <span id="statusText">Disconnected</span>
+      </div>
+      <div class="meta" id="pendingCount" style="display: none;">
+        Pending tasks: <span id="pendingNum">0</span>
+      </div>
+    </div>
+
+    <div class="url-section">
+      <label for="backendUrl">Backend URL</label>
+      <input
+        type="text"
+        id="backendUrl"
+        placeholder="ws://localhost:8000/api/v1/extension/connect"
+      >
+      <button id="saveUrl" class="btn-secondary">Save</button>
+    </div>
+
+    <div class="actions">
+      <button id="connectBtn" class="btn-primary">Connect</button>
+      <button id="disconnectBtn" class="btn-danger" style="display: none;">Disconnect</button>
+    </div>
+
+    <div class="toggle-section">
+      <label class="toggle">
+        <input type="checkbox" id="autoConnect" checked>
+        <span>Auto-connect on startup</span>
+      </label>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
