@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
-from shopee_scraper.api.enums import JobStatus  # noqa: F401 - re-exported
+from shopee_scraper.api.enums import JobStatus
 from shopee_scraper.exceptions import QueueFullError
 from shopee_scraper.utils.config import JobQueueSettings
 from shopee_scraper.utils.logging import get_logger
@@ -613,8 +613,39 @@ async def setup_job_queue(
             max_reviews=max_reviews,
         )
 
+    # Extension-based handlers (force execution_mode="extension")
+    async def scrape_via_extension_handler(
+        keyword: str,
+        max_pages: int = 1,
+        sort_by: str = "relevancy",
+    ) -> dict[str, Any]:
+        """Handler for extension-based search jobs."""
+        return await scraper_service.search_products(
+            keyword=keyword,
+            max_pages=max_pages,
+            sort_by=sort_by,
+            max_reviews=0,
+            execution_mode="extension",
+        )
+
+    async def scrape_product_via_extension_handler(
+        shop_id: int,
+        item_id: int,
+    ) -> dict[str, Any]:
+        """Handler for extension-based product detail jobs."""
+        result = await scraper_service.get_product(
+            shop_id=shop_id,
+            item_id=item_id,
+            execution_mode="extension",
+        )
+        return result or {"error": "Product not found"}
+
     queue.register_handler("scrape_list", scrape_list_handler)
     queue.register_handler("scrape_list_and_details", scrape_list_and_details_handler)
+    queue.register_handler("scrape_via_extension", scrape_via_extension_handler)
+    queue.register_handler(
+        "scrape_product_via_extension", scrape_product_via_extension_handler
+    )
 
     # Start the queue
     await queue.start()

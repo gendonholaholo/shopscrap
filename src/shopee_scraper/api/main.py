@@ -98,10 +98,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         logger.info("Job queue initialized with Redis backend")
 
         # Initialize Extension Manager
-        await init_extension_manager(
+        extension_manager = await init_extension_manager(
             task_timeout=settings.extension.task_timeout_seconds,
             heartbeat_timeout=settings.extension.heartbeat_timeout_seconds,
         )
+        scraper_service.set_extension_manager(extension_manager)
         logger.info("Extension manager initialized")
     except Exception as e:
         logger.warning(f"Failed to initialize job queue: {e}")
