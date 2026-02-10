@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from shopee_scraper.core.scraper import ShopeeScraper
+from shopee_scraper.extension.bridge import ExtensionBridge
+from shopee_scraper.extension.protocol import TaskType
 from shopee_scraper.models.output import ProductOutput, _dataclass_to_dict
 from shopee_scraper.utils.config import get_settings
 from shopee_scraper.utils.health_checker import HealthChecker
@@ -15,6 +17,7 @@ from shopee_scraper.utils.transformer import create_export
 
 
 if TYPE_CHECKING:
+    from shopee_scraper.extension.manager import ExtensionManager
     from shopee_scraper.services.cache import ProductCache, ReviewCache
 
 logger = get_logger(__name__)
@@ -29,6 +32,9 @@ class ScraperService:
 
     Supports optional caching via ProductCache and ReviewCache for
     improved performance and reduced scraping load.
+
+    Supports Chrome Extension as an alternative execution backend
+    (extension mode) for bypassing anti-bot detection.
     """
 
     def __init__(
@@ -43,6 +49,8 @@ class ScraperService:
         self._health_checker = HealthChecker(data_dir="./data")
         self._product_cache: ProductCache | None = None
         self._review_cache: ReviewCache | None = None
+        self._extension_manager: ExtensionManager | None = None
+        self._extension_bridge = ExtensionBridge()
 
     def set_caches(
         self,
@@ -62,6 +70,23 @@ class ScraperService:
             logger.info("Product caching enabled")
         if review_cache:
             logger.info("Review caching enabled")
+
+    def set_extension_manager(self, manager: ExtensionManager) -> None:
+        """Set the ExtensionManager for extension-based scraping."""
+        self._extension_manager = manager
+        logger.info("Extension manager set on ScraperService")
+
+    def _should_use_extension(self, execution_mode: str) -> bool:
+        """Determine whether to use extension for this request."""
+        if execution_mode == "extension":
+            return True
+        if execution_mode == "browser":
+            return False
+        # auto mode: prefer extension if available
+        return (
+            self._extension_manager is not None
+            and self._extension_manager.has_available()
+        )
 
     async def _get_scraper(self) -> ShopeeScraper:
         """Get or create scraper instance with proxy and captcha settings."""
@@ -119,13 +144,24 @@ class ScraperService:
         sort_by: str = "relevancy",
         max_reviews: int = 5,
         save: bool = False,
+        execution_mode: str = "auto",
     ) -> dict[str, Any]:
         """
         Search products by keyword with full details.
 
+        Args:
+            execution_mode: "auto" | "browser" | "extension"
+
         Returns:
             Dict with ExportOutput-compatible format
         """
+        if self._should_use_extension(execution_mode):
+            return await self._search_via_extension(
+                keyword=keyword,
+                max_pages=max_pages,
+                sort_by=sort_by,
+            )
+
         scraper = await self._get_scraper()
         logger.info(f"Service: searching for '{keyword}'")
 
@@ -154,6 +190,7 @@ class ScraperService:
         max_reviews: int = 5,
         save: bool = False,
         use_cache: bool = True,
+        execution_mode: str = "auto",
     ) -> dict[str, Any] | None:
         """
         Get product detail by shop_id and item_id.
@@ -164,6 +201,7 @@ class ScraperService:
             max_reviews: Maximum reviews to fetch
             save: Whether to save to file
             use_cache: Whether to use cache (if available)
+            execution_mode: "auto" | "browser" | "extension"
 
         Returns:
             Product data dict or None if not found
@@ -174,6 +212,14 @@ class ScraperService:
             if cached:
                 logger.info(f"Service: cache hit for product {shop_id}/{item_id}")
                 return cached
+
+        if self._should_use_extension(execution_mode):
+            result = await self._get_product_via_extension(
+                shop_id=shop_id, item_id=item_id
+            )
+            if use_cache and self._product_cache and result:
+                await self._product_cache.set(shop_id, item_id, result)
+            return result
 
         # Fetch from scraper
         scraper = await self._get_scraper()
@@ -246,8 +292,16 @@ class ScraperService:
         item_id: int,
         max_reviews: int = 100,
         save: bool = False,
+        execution_mode: str = "auto",
     ) -> dict[str, Any]:
         """Get product reviews."""
+        if self._should_use_extension(execution_mode):
+            return await self._get_reviews_via_extension(
+                shop_id=shop_id,
+                item_id=item_id,
+                max_reviews=max_reviews,
+            )
+
         scraper = await self._get_scraper()
         logger.info(f"Service: getting reviews for {shop_id}/{item_id}")
 
@@ -280,6 +334,81 @@ class ScraperService:
         )
 
         return summary
+
+    # =========================================================================
+    # Extension-based Operations
+    # =========================================================================
+
+    async def _search_via_extension(
+        self,
+        keyword: str,
+        max_pages: int = 1,
+        sort_by: str = "relevancy",
+    ) -> dict[str, Any]:
+        """Execute search via Chrome Extension."""
+        assert self._extension_manager is not None
+        logger.info(f"Service: searching via extension for '{keyword}'")
+
+        task_id = await self._extension_manager.dispatch_task(
+            task_type=TaskType.SEARCH,
+            params={
+                "keyword": keyword,
+                "maxPages": max_pages,
+                "sortBy": sort_by,
+            },
+        )
+
+        raw_data = await self._extension_manager.wait_for_result(task_id)
+        products = self._extension_bridge.process_search_result(raw_data)
+        return self._extension_bridge.create_export_output(products)
+
+    async def _get_product_via_extension(
+        self,
+        shop_id: int,
+        item_id: int,
+    ) -> dict[str, Any] | None:
+        """Get product detail via Chrome Extension."""
+        assert self._extension_manager is not None
+        logger.info(f"Service: getting product via extension {shop_id}/{item_id}")
+
+        task_id = await self._extension_manager.dispatch_task(
+            task_type=TaskType.PRODUCT,
+            params={"shopId": shop_id, "itemId": item_id},
+        )
+
+        raw_data = await self._extension_manager.wait_for_result(task_id)
+        product = self._extension_bridge.process_product_result(raw_data)
+        if not product:
+            return None
+        return _dataclass_to_dict(product)
+
+    async def _get_reviews_via_extension(
+        self,
+        shop_id: int,
+        item_id: int,
+        max_reviews: int = 100,
+    ) -> dict[str, Any]:
+        """Get reviews via Chrome Extension."""
+        assert self._extension_manager is not None
+        logger.info(f"Service: getting reviews via extension {shop_id}/{item_id}")
+
+        task_id = await self._extension_manager.dispatch_task(
+            task_type=TaskType.REVIEWS,
+            params={
+                "shopId": shop_id,
+                "itemId": item_id,
+                "maxReviews": max_reviews,
+            },
+        )
+
+        raw_data = await self._extension_manager.wait_for_result(task_id)
+        reviews = self._extension_bridge.process_reviews_result(raw_data)
+        return {
+            "shop_id": shop_id,
+            "item_id": item_id,
+            "total_count": len(reviews),
+            "reviews": reviews,
+        }
 
     # =========================================================================
     # Health Check
