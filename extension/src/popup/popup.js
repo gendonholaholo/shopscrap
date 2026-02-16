@@ -2,7 +2,7 @@
  * Popup logic: connection status, backend URL config, connect/disconnect.
  */
 
-const DEFAULT_URL = 'ws://localhost:8000/api/v1/extension/connect';
+const DEFAULT_URL = 'ws://localhost:8002/api/v1/extension/connect';
 
 // DOM elements
 const statusDot = document.getElementById('statusDot');

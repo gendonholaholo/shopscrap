@@ -108,9 +108,9 @@ class ExtensionBridge:
         if not item_id or not shop_id:
             return {}
 
-        # Price conversion
-        price_raw = item.get("price", 0)
-        price_min = item.get("price_min", price_raw)
+        # Price conversion (guard against None values from API)
+        price_raw = item.get("price") or 0
+        price_min = item.get("price_min") or price_raw
         price = price_min / PRICE_DIVISOR if price_min else 0
 
         # Images
@@ -128,8 +128,8 @@ class ExtensionBridge:
             "shop_id": shop_id,
             "name": item.get("name", ""),
             "price": price,
-            "stock": item.get("stock", 0),
-            "sold": item.get("sold", item.get("historical_sold", 0)),
+            "stock": item.get("stock") or 0,
+            "sold": item.get("sold") or item.get("historical_sold") or 0,
             "rating": rating,
             "rating_count": rating_count,
             "images": image_urls,

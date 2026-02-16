@@ -102,6 +102,7 @@ async def scrape_list(
         data=job.to_dict(),
         links={
             "self": f"/api/v1/jobs/{job.id}",
+            "download": f"/api/v1/jobs/{job.id}/download",
             "status": f"/api/v1/jobs/{job.id}/status",
         },
     )
@@ -157,6 +158,7 @@ async def scrape_list_and_details(
         data=job.to_dict(),
         links={
             "self": f"/api/v1/jobs/{job.id}",
+            "download": f"/api/v1/jobs/{job.id}/download",
             "status": f"/api/v1/jobs/{job.id}/status",
         },
     )

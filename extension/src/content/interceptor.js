@@ -1,104 +1,19 @@
 /**
- * Content Script: Shopee API interception via fetch/XHR monkey-patching.
+ * Content Script (ISOLATED world): Receives intercepted API data and handles tasks.
  *
- * Injected into Shopee pages at document_start. Intercepts API responses
- * by monkey-patching window.fetch() and XMLHttpRequest.
+ * The fetch/XHR monkey-patching runs in a separate MAIN world script
+ * (interceptor-main.js) to bypass CSP restrictions. This script receives
+ * the intercepted data via window.postMessage and coordinates with the
+ * service worker for task execution.
  *
  * Communication flow:
- *   Page context (injected script) → window.postMessage →
- *   Content script → chrome.runtime.sendMessage → Service Worker
+ *   interceptor-main.js (MAIN world) → window.postMessage →
+ *   This script (ISOLATED world) → chrome.runtime.sendMessage → Service Worker
  */
-
-// API patterns to intercept
-const API_PATTERNS = [
-  '/api/v4/search/search_items',
-  '/api/v4/pdp/get_pc',
-  '/api/v4/item/get',
-  '/api/v2/item/get_ratings',
-  '/api/v4/pdp/get_rw',
-];
 
 // Storage for captured API responses
 const capturedResponses = new Map(); // pattern → latest response data
 let activeTask = null; // current task being executed
-
-// ============================================================================
-// Inject interceptor script into page context
-// ============================================================================
-
-function injectInterceptor() {
-  const script = document.createElement('script');
-  script.textContent = `
-    (function() {
-      'use strict';
-
-      const API_PATTERNS = ${JSON.stringify(API_PATTERNS)};
-
-      function matchesPattern(url) {
-        return API_PATTERNS.find(pattern => url.includes(pattern));
-      }
-
-      // ---- Monkey-patch fetch() ----
-      const originalFetch = window.fetch;
-      window.fetch = async function(...args) {
-        const response = await originalFetch.apply(this, args);
-        const url = (typeof args[0] === 'string') ? args[0] : args[0]?.url || '';
-        const pattern = matchesPattern(url);
-
-        if (pattern) {
-          try {
-            const cloned = response.clone();
-            const data = await cloned.json();
-            window.postMessage({
-              type: '__SHOPEE_SCRAPER_API__',
-              pattern: pattern,
-              url: url,
-              data: data,
-            }, '*');
-          } catch(e) {
-            // Ignore parse errors
-          }
-        }
-
-        return response;
-      };
-
-      // ---- Monkey-patch XMLHttpRequest ----
-      const originalOpen = XMLHttpRequest.prototype.open;
-      const originalSend = XMLHttpRequest.prototype.send;
-
-      XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-        this._shopeeUrl = url;
-        this._shopeePattern = matchesPattern(url);
-        return originalOpen.call(this, method, url, ...rest);
-      };
-
-      XMLHttpRequest.prototype.send = function(...args) {
-        if (this._shopeePattern) {
-          this.addEventListener('load', function() {
-            try {
-              const data = JSON.parse(this.responseText);
-              window.postMessage({
-                type: '__SHOPEE_SCRAPER_API__',
-                pattern: this._shopeePattern,
-                url: this._shopeeUrl,
-                data: data,
-              }, '*');
-            } catch(e) {
-              // Ignore parse errors
-            }
-          });
-        }
-        return originalSend.apply(this, args);
-      };
-    })();
-  `;
-  (document.head || document.documentElement).appendChild(script);
-  script.remove();
-}
-
-// Inject as early as possible
-injectInterceptor();
 
 // ============================================================================
 // Listen for intercepted API responses from page context
@@ -156,12 +71,10 @@ async function executeTask(taskId, taskType, params) {
       throw new Error(`Unknown task type: ${taskType}`);
   }
 
-  // Clear previous captures for this pattern
-  capturedResponses.delete(expectedPattern);
-
-  // Check if we already have fresh data (race condition: page loaded before task)
+  // Check if we already have fresh data (page loaded before task was dispatched)
   const existing = capturedResponses.get(expectedPattern);
-  if (existing && isRelevantData(existing, taskType, params)) {
+  if (existing) {
+    capturedResponses.delete(expectedPattern);
     return existing;
   }
 
@@ -213,8 +126,10 @@ function isRelevantData(data, taskType, params) {
   if (!data) return false;
 
   switch (taskType) {
-    case 'search':
-      return data.items && data.items.length > 0;
+    case 'search': {
+      const items = data.items || data.data?.items;
+      return Array.isArray(items) && items.length > 0;
+    }
     case 'product':
       return data.data || data.item;
     case 'reviews':

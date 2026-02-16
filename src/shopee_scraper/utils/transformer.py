@@ -101,8 +101,9 @@ def transform_product(
     images = product_data.get("images", [])
     thumbnail = images[0] + "~thumb.jpeg" if images else ""
 
-    # Get price (convert from float to int)
-    price = int(product_data.get("price", 0))
+    # Get price (convert from float to int), guard against None
+    price = int(product_data.get("price") or 0)
+    stock = product_data.get("stock") or 0
 
     return ProductOutput(
         id=str(item_id),
@@ -113,11 +114,11 @@ def transform_product(
         thumbnail=thumbnail,
         images=images,
         seller=seller,
-        rating=product_data.get("rating", 0.0),
-        reviewCount=product_data.get("rating_count", 0),
-        soldCount=product_data.get("sold", 0),
-        stock=product_data.get("stock", 0),
-        isAvailable=product_data.get("stock", 0) > 0,
+        rating=product_data.get("rating") or 0.0,
+        reviewCount=product_data.get("rating_count") or 0,
+        soldCount=product_data.get("sold") or 0,
+        stock=stock,
+        isAvailable=stock > 0,
         description=product_data.get("description", ""),
         descriptionHtml=_text_to_html(product_data.get("description", "")),
         category=category,

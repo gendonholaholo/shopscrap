@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Path, Query, Response, status
@@ -66,6 +67,47 @@ async def list_jobs(
 
 
 @router.get(
+    "/{job_id}/download",
+    summary="Download job results",
+    description="Download completed job results as a JSON file.",
+)
+async def download_job_result(
+    _api_key: RequireApiKey,
+    job_id: str = Path(..., description="Job ID"),
+) -> Response:
+    """Download completed job results as a JSON file."""
+    queue = get_job_queue()
+    job = await queue.get_job(job_id)
+
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job not found: {job_id}",
+        )
+
+    if job.status != JobStatus.COMPLETED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Job not completed (status: {job.status.value})",
+        )
+
+    if not job.result:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Job has no results",
+        )
+
+    filename = f"shopee-{job.type}-{job.id[:8]}.json"
+    content = json.dumps(job.result, ensure_ascii=False, indent=2)
+
+    return Response(
+        content=content,
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get(
     "/{job_id}",
     summary="Get job details",
     description="Get full details and results of a job.",
@@ -89,6 +131,7 @@ async def get_job(
         "data": job.to_dict(),
         "links": {
             "self": f"/api/v1/jobs/{job_id}",
+            "download": f"/api/v1/jobs/{job_id}/download",
             "list": "/api/v1/jobs",
         },
     }

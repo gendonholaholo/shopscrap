@@ -6,7 +6,7 @@
  * on Shopee tabs, and returns raw API JSON results to the backend.
  */
 
-const DEFAULT_BACKEND_URL = 'ws://localhost:8000/api/v1/extension/connect';
+const DEFAULT_BACKEND_URL = 'ws://localhost:8002/api/v1/extension/connect';
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const RECONNECT_DELAY_MS = 5_000;
 const BASE_URL = 'https://shopee.co.id';
