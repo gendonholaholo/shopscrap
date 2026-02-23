@@ -4,16 +4,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Shopee Scraper is a high-performance web scraper for Shopee.co.id using Camoufox anti-detect browser. It provides three interfaces: CLI, REST API, and gRPC.
+Shopee Scraper is a REST API for scraping Shopee.co.id. It supports two execution modes:
+- **Browser mode**: Headless Chrome via `nodriver` (anti-detection)
+- **Extension mode**: Chrome Extension connected via WebSocket, intercepting real browser sessions
+
+Three interfaces are exposed: CLI, REST API, and gRPC.
 
 ## Common Commands
 
 ```bash
 # Install dependencies
 uv sync
-
-# Install Camoufox browser (required)
-camoufox fetch
 
 # Run CLI
 uv run shopee-scraper search "keyword" --max-pages 2
@@ -55,42 +56,60 @@ REST API (api/) ──────────────┤         │       
 gRPC (grpc/) ─────────────────┘         │                   ├── ProductExtractor
                                         │                   └── ReviewExtractor
                                         │
-                                        └──► BrowserManager (Camoufox)
+                              ┌─────────┴──────────┐
+                              │                    │
+                         BrowserManager      ExtensionManager
+                         (nodriver/Chrome)   (WebSocket gateway)
+                                                   │
+                                             ExtensionBridge
+                                             (raw JSON → models)
 ```
 
 ### Key Components
 
-- **`ShopeeScraper`** (`core/scraper.py`): Main orchestrator that coordinates browser, session, and extractors
-- **`BrowserManager`** (`core/browser.py`): Manages Camoufox anti-detect browser instances
-- **`SessionManager`** (`core/session.py`): Cookie-based login state persistence
-- **Extractors** (`extractors/`): Navigate pages and intercept Shopee's internal API responses
-- **`ScraperService`** (`services/scraper_service.py`): Service layer wrapper used by API/gRPC
+- **`ShopeeScraper`** (`core/scraper.py`): Main orchestrator. Chooses between browser and extension execution based on `execution_mode` (`auto` | `browser` | `extension`).
+- **`BrowserManager`** (`core/browser.py`): Manages Chrome via `nodriver` for anti-detection. Supports proxy pools and session persistence via user data directory.
+- **`SessionManager`** (`core/session.py`): Cookie-based login state persistence.
+- **Extractors** (`extractors/`): Navigate pages and intercept Shopee's internal API responses via CDP network interception.
+- **`ExtensionManager`** (`extension/manager.py`): Manages Chrome Extension WebSocket connections and dispatches tasks to connected extension instances.
+- **`ExtensionBridge`** (`extension/bridge.py`): Transforms raw Shopee API JSON captured by the extension into `ProductOutput` models using the same transformer pipeline as extractors.
+- **`ScraperService`** (`services/scraper_service.py`): Service layer wrapper used by API/gRPC.
 
 ### Data Flow
 
-Extractors work by intercepting Shopee's internal API calls (e.g., `/api/v4/search/search_items`, `/api/v4/pdp/get_pc`) rather than parsing HTML. This is more reliable as Shopee's API responses are structured JSON.
+Extractors intercept Shopee's internal API calls (e.g., `/api/v4/search/search_items`, `/api/v4/pdp/get_pc`) rather than parsing HTML. In extension mode, the Chrome Extension MAIN world content script intercepts these same responses and sends raw JSON back via WebSocket.
+
+### Chrome Extension
+
+Located in `extension/` (Chrome Manifest V3). It connects to the backend via WebSocket at `/api/v1/extension/connect`. The backend dispatches scrape tasks; the extension executes them in a real browser session and returns raw API JSON.
 
 ### API Structure
 
 ```
 /api/v1/
-├── session/           # Cookie management (browser extension upload)
-│   ├── cookie-upload  POST
-│   └── cookie-status  GET
-├── products/          # Scraping operations (async)
-│   ├── scrape-list              POST → returns job_id
-│   ├── scrape-list-and-details  POST → returns job_id
-│   └── {shop_id}/{item_id}      GET  → sync direct access
-├── jobs/              # Job management
-│   ├── (list)         GET
+├── session/
+│   ├── cookie-upload        POST  # Upload cookies from browser extension
+│   └── cookie-status        GET
+├── products/
+│   ├── scrape-list              POST → job_id  (async)
+│   ├── scrape-list-and-details  POST → job_id  (async)
+│   ├── {shop_id}/{item_id}      GET            (sync)
+│   └── {shop_id}/{item_id}/reviews  GET        (sync)
+│       └── /overview            GET            (aggregated stats)
+├── jobs/
+│   ├── (list)               GET
 │   └── {job_id}/
-│       ├── (detail)   GET
-│       ├── status     GET
-│       └── (cancel)   DELETE
-└── /health            # Health checks
+│       ├── (detail)         GET
+│       ├── download         GET   # Download results as JSON file
+│       └── (cancel)         DELETE
+├── extension/
+│   ├── status               GET   # List connected extensions
+│   └── connect              WS    # Extension WebSocket gateway
+├── /ws/jobs/{job_id}        WS    # Real-time job progress
+└── /health                  GET   # + /health/live, /health/ready
 ```
 
-All scraping operations are async and return a `job_id`. Poll `/jobs/{job_id}/status` until completed.
+All scraping POST operations are async and return `job_id`. The `execution_mode` parameter (`auto` | `extension` | `browser`) controls which path is used; `auto` prefers extension if connected.
 
 ### Price Handling
 
@@ -98,15 +117,25 @@ Shopee returns prices multiplied by 100,000 (e.g., `15000000000` = Rp 150,000). 
 
 ## Configuration
 
-Environment variables in `.env`:
-- `SHOPEE_ENV`: development | production
-- `API_AUTH_ENABLED`: Enable API key authentication
-- `RATE_LIMIT_ENABLED`: Enable rate limiting
-- Session cookies stored in `./data/sessions/`
-- Output files in `./data/output/`
+Copy `.env.example` to `.env`. Key variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SHOPEE_ENV` | `development` | `development` or `production` |
+| `API_AUTH_ENABLED` | `false` | Enable API key auth (always `true` in Docker prod) |
+| `API_KEYS` | — | Comma-separated API keys (`sk_...`) |
+| `JOB_QUEUE_REDIS_URL` | `redis://localhost:6379/1` | Redis for job queue (DB 1) |
+| `RATE_LIMIT_STORAGE` | `memory` | `memory` or `redis` (rate limiter uses DB 0) |
+| `PROXY_ENABLED` | `false` | Enable proxy; configure `PROXY_HOST`, `PROXY_PORT` |
+| `CAPTCHA_ENABLED` | `false` | Enable CAPTCHA solver |
+| `CAPTCHA_API_KEY` | — | SadCaptcha or 2Captcha API key |
+| `HEADLESS` | `true` | Browser headless mode |
+
+Session cookies are stored in `./data/sessions/`; output files in `./data/output/`.
 
 ## Testing Notes
 
-- Use `pytest-asyncio` for async tests (mode is set to "auto")
-- Integration tests require `@pytest.mark.integration` marker
-- Protobuf generated files (`*_pb2*.py`) are excluded from linting
+- `pytest-asyncio` in `auto` mode — all async test functions run without explicit decorator
+- Integration tests require `@pytest.mark.integration` marker; run with `uv run pytest tests/integration -v`
+- Use `fakeredis` for Redis mocking in unit tests (no real Redis needed)
+- Protobuf generated files (`*_pb2*.py`) are excluded from linting and mypy

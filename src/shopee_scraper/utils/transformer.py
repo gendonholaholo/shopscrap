@@ -151,8 +151,8 @@ def _transform_variants(product_data: dict[str, Any]) -> list[VariantInfo]:
                     matching_model = model
                     break
 
-            price = int(matching_model.get("price", 0)) if matching_model else 0
-            stock = matching_model.get("stock", 0) if matching_model else 0
+            price = int(matching_model.get("price") or 0) if matching_model else 0
+            stock = (matching_model.get("stock") or 0) if matching_model else 0
 
             options.append(
                 VariantOption(
