@@ -1,6 +1,6 @@
 [project]
 name = "shopee-scraper"
-version = "0.3.1"
+version = "0.3.2"
 description = "High-performance Shopee scraper using Camoufox anti-detect browser"
 readme = "README.md"
 license = { text = "MIT" }
