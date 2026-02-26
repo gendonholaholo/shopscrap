@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Any
 
 from shopee_scraper.core.scraper import ShopeeScraper
@@ -13,12 +14,13 @@ from shopee_scraper.utils.health_checker import HealthChecker
 from shopee_scraper.utils.logging import get_logger
 from shopee_scraper.utils.proxy import ProxyConfig, ProxyPool
 from shopee_scraper.utils.system_monitor import get_uptime
-from shopee_scraper.utils.transformer import create_export
+from shopee_scraper.utils.transformer import create_export, transform_product
 
 
 if TYPE_CHECKING:
     from shopee_scraper.extension.manager import ExtensionManager
     from shopee_scraper.services.cache import ProductCache, ReviewCache
+    from shopee_scraper.storage.scrape_logger import ScrapeLogger
 
 logger = get_logger(__name__)
 
@@ -51,6 +53,7 @@ class ScraperService:
         self._review_cache: ReviewCache | None = None
         self._extension_manager: ExtensionManager | None = None
         self._extension_bridge = ExtensionBridge()
+        self._scrape_logger: ScrapeLogger | None = None
 
     def set_caches(
         self,
@@ -75,6 +78,11 @@ class ScraperService:
         """Set the ExtensionManager for extension-based scraping."""
         self._extension_manager = manager
         logger.info("Extension manager set on ScraperService")
+
+    def set_scrape_logger(self, scrape_logger: ScrapeLogger) -> None:
+        """Set the ScrapeLogger for database logging."""
+        self._scrape_logger = scrape_logger
+        logger.info("Scrape logger set on ScraperService")
 
     def _should_use_extension(self, execution_mode: str) -> bool:
         """Determine whether to use extension for this request."""
@@ -160,6 +168,7 @@ class ScraperService:
                 keyword=keyword,
                 max_pages=max_pages,
                 sort_by=sort_by,
+                max_reviews=max_reviews,
             )
 
         scraper = await self._get_scraper()
@@ -339,16 +348,72 @@ class ScraperService:
     # Extension-based Operations
     # =========================================================================
 
+    async def _get_product_normalized_via_extension(
+        self,
+        shop_id: int,
+        item_id: int,
+    ) -> dict[str, Any]:
+        """Get product detail via extension and return normalized dict (pre-transform).
+
+        Returns:
+            Normalized product dict or empty dict on failure
+        """
+        assert self._extension_manager is not None
+        try:
+            task_id = await self._extension_manager.dispatch_task(
+                task_type=TaskType.PRODUCT,
+                params={"shopId": shop_id, "itemId": item_id},
+            )
+            raw_data = await self._extension_manager.wait_for_result(task_id)
+            normalized = self._extension_bridge.normalize_product_result(raw_data)
+            return normalized
+        except Exception as e:
+            logger.warning(
+                f"Failed to get product detail via extension: {e}",
+                shop_id=shop_id,
+                item_id=item_id,
+            )
+            return {}
+
+    async def _get_reviews_raw_via_extension(
+        self,
+        shop_id: int,
+        item_id: int,
+        max_reviews: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Get reviews via extension and return normalized review dicts."""
+        assert self._extension_manager is not None
+        try:
+            task_id = await self._extension_manager.dispatch_task(
+                task_type=TaskType.REVIEWS,
+                params={
+                    "shopId": shop_id,
+                    "itemId": item_id,
+                    "maxReviews": max_reviews,
+                },
+            )
+            raw_data = await self._extension_manager.wait_for_result(task_id)
+            return self._extension_bridge.process_reviews_result(raw_data)
+        except Exception as e:
+            logger.warning(
+                f"Failed to get reviews via extension: {e}",
+                shop_id=shop_id,
+                item_id=item_id,
+            )
+            return []
+
     async def _search_via_extension(
         self,
         keyword: str,
         max_pages: int = 1,
         sort_by: str = "relevancy",
+        max_reviews: int = 5,
     ) -> dict[str, Any]:
-        """Execute search via Chrome Extension."""
+        """Execute search via Chrome Extension with detail + review enrichment."""
         assert self._extension_manager is not None
         logger.info(f"Service: searching via extension for '{keyword}'")
 
+        # Step 1: Get search results
         task_id = await self._extension_manager.dispatch_task(
             task_type=TaskType.SEARCH,
             params={
@@ -357,10 +422,69 @@ class ScraperService:
                 "sortBy": sort_by,
             },
         )
-
         raw_data = await self._extension_manager.wait_for_result(task_id)
-        products = self._extension_bridge.process_search_result(raw_data)
-        return self._extension_bridge.create_export_output(products)
+
+        # Parse search results to get basic product list
+        search_products = self._extension_bridge.process_search_result(raw_data)
+
+        if not search_products:
+            return self._extension_bridge.create_export_output([])
+
+        # Step 2: Enrich each product with detail + reviews
+        enriched_products: list[ProductOutput] = []
+
+        for i, basic_product in enumerate(search_products):
+            shop_id = int(basic_product.seller.id) if basic_product.seller.id else 0
+            item_id = int(basic_product.id) if basic_product.id else 0
+
+            if not shop_id or not item_id:
+                enriched_products.append(basic_product)
+                continue
+
+            logger.info(
+                f"Enriching product {i + 1}/{len(search_products)}",
+                shop_id=shop_id,
+                item_id=item_id,
+            )
+
+            # Fetch product detail
+            product_data = await self._get_product_normalized_via_extension(
+                shop_id, item_id
+            )
+
+            # Fetch reviews if requested
+            reviews_data: list[dict[str, Any]] = []
+            if max_reviews > 0:
+                reviews_data = await self._get_reviews_raw_via_extension(
+                    shop_id, item_id, max_reviews=max_reviews
+                )
+
+            if product_data:
+                # Transform enriched data into ProductOutput
+                enriched = transform_product(product_data, reviews_data)
+                enriched_products.append(enriched)
+
+                # Log to DB
+                if self._scrape_logger:
+                    await self._scrape_logger.log_product(
+                        normalized_data=product_data,
+                        source="extension",
+                        api_format="bff"
+                        if "product_price" in str(product_data)
+                        else "legacy",
+                    )
+            else:
+                # Fallback: keep basic search result
+                enriched_products.append(basic_product)
+
+            # Rate limit between requests
+            if i < len(search_products) - 1:
+                await asyncio.sleep(1.0)
+
+        logger.info(
+            f"Extension search enrichment complete: {len(enriched_products)} products"
+        )
+        return self._extension_bridge.create_export_output(enriched_products)
 
     async def _get_product_via_extension(
         self,

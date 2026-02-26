@@ -254,6 +254,28 @@ class CaptchaSettings(BaseSettings):
     max_retries: int = Field(default=3, description="Retry attempts for solving")
 
 
+class DatabaseSettings(BaseSettings):
+    """PostgreSQL database configuration for scrape logging."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="DB_",
+        env_file=".env",
+        extra="ignore",
+    )
+
+    enabled: bool = Field(default=False, description="Enable PostgreSQL scrape logging")
+    host: str = Field(default="localhost", description="Database host")
+    port: int = Field(default=5432, description="Database port")
+    user: str = Field(default="shopee", description="Database user")
+    password: str = Field(default="shopee_secret", description="Database password")
+    name: str = Field(default="shopee-scraper-development", description="Database name")
+
+    @property
+    def url(self) -> str:
+        """Build async PostgreSQL connection URL."""
+        return f"postgresql+asyncpg://{self.user}:{self.password}@{self.host}:{self.port}/{self.name}"
+
+
 class ExtensionSettings(BaseSettings):
     """Chrome Extension backend configuration."""
 
@@ -299,6 +321,7 @@ class Settings(BaseSettings):
     job_queue: JobQueueSettings = Field(default_factory=JobQueueSettings)
     cache: CacheSettings = Field(default_factory=CacheSettings)
     captcha: CaptchaSettings = Field(default_factory=CaptchaSettings)
+    database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     extension: ExtensionSettings = Field(default_factory=ExtensionSettings)
     output_dir: Path = Path("./data/output")
     log_level: str = "INFO"

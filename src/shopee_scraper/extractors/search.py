@@ -442,6 +442,7 @@ class SearchExtractor(BaseExtractor):
             logger.warning(f"API response contains error: {error_val}")
             # Log first 200 chars of response for debugging
             import json
+
             response_preview = json.dumps(data)[:200]
             logger.debug(f"Error response preview: {response_preview}")
 

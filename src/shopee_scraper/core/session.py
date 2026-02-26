@@ -330,7 +330,9 @@ class SessionManager:
                 return False
 
             # If redirected to homepage, check if user is already logged in
-            if current_url.rstrip("/") == self.HOME_URL.rstrip("/") or current_url.startswith(self.HOME_URL):
+            if current_url.rstrip("/") == self.HOME_URL.rstrip(
+                "/"
+            ) or current_url.startswith(self.HOME_URL):
                 # Check if already logged in via Chrome profile cookies
                 if await self._check_already_logged_in(page, browser):
                     logger.info("Already logged in (detected from Chrome profile)")
@@ -369,8 +371,16 @@ class SessionManager:
             # Check 1: Look for auth cookies
             cookies = await browser.get_cookies()
             auth_cookie_names = {
-                "SPC_EC", "SPC_ST", "SPC_CDS", "SPC_U", "SPC_F",
-                "SPC_R_T_ID", "SPC_T_ID", "SPC_T_IV", "SPC_SI", "SPC_SEC_SI",
+                "SPC_EC",
+                "SPC_ST",
+                "SPC_CDS",
+                "SPC_U",
+                "SPC_F",
+                "SPC_R_T_ID",
+                "SPC_T_ID",
+                "SPC_T_IV",
+                "SPC_SI",
+                "SPC_SEC_SI",
             }
             auth_cookies = [c for c in cookies if c.get("name") in auth_cookie_names]
 
@@ -394,7 +404,9 @@ class SessionManager:
                 try:
                     element = await page.find(selector, timeout=2)
                     if element:
-                        logger.info(f"User profile element found with selector: {selector}")
+                        logger.info(
+                            f"User profile element found with selector: {selector}"
+                        )
                         return True
                 except Exception:
                     continue

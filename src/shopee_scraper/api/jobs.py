@@ -624,7 +624,7 @@ async def setup_job_queue(
             keyword=keyword,
             max_pages=max_pages,
             sort_by=sort_by,
-            max_reviews=0,
+            max_reviews=5,
             execution_mode="extension",
         )
 

@@ -83,7 +83,9 @@ def print_products(products: list[dict], all_products: list[dict]) -> None:
         print(f"          Price: Rp {product.get('price', 0):,}")
         print(f"          Sold: {product.get('sold', 0)}")
 
-    print(f"\n[✓] Got {len(products)} products (from {len(all_products)} total on page)")
+    print(
+        f"\n[✓] Got {len(products)} products (from {len(all_products)} total on page)"
+    )
 
 
 def print_results(products: list[dict]) -> None:

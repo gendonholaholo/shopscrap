@@ -170,6 +170,116 @@ class TestProcessProductResult:
         product = self.bridge.process_product_result(raw)
         assert product is None
 
+    def test_bff_format_with_product_detail_description(self) -> None:
+        """BFF format should extract description from product_detail."""
+        raw = {
+            "data": {
+                "item": {
+                    "item_id": 55555,
+                    "shop_id": 66666,
+                    "title": "BFF Product",
+                    "stock": 10,
+                    "condition": 1,
+                },
+                "product_price": {
+                    "price": {
+                        "single_value": 500000000000,
+                        "range_min": 500000000000,
+                        "range_max": 500000000000,
+                    },
+                },
+                "product_detail": {
+                    "description": "This is a BFF description from product_detail",
+                },
+                "product_images": {"images": ["img_abc"]},
+                "shop_detailed": {"name": "Test Shop"},
+                "product_review": {
+                    "rating_star": 4.5,
+                    "total_rating_count": 100,
+                },
+            }
+        }
+
+        product = self.bridge.process_product_result(raw)
+        assert product is not None
+        assert product.description == "This is a BFF description from product_detail"
+        assert product.title == "BFF Product"
+
+    def test_bff_format_empty_description_fallback(self) -> None:
+        """BFF format with empty product_detail should fallback to item.description."""
+        raw = {
+            "data": {
+                "item": {
+                    "item_id": 77777,
+                    "shop_id": 88888,
+                    "title": "Fallback Product",
+                    "description": "Fallback desc from item",
+                    "stock": 5,
+                    "condition": 1,
+                },
+                "product_price": {
+                    "price": {"single_value": 100000000000},
+                },
+                "product_detail": {},
+                "product_images": {"images": []},
+                "shop_detailed": {},
+                "product_review": {},
+            }
+        }
+
+        product = self.bridge.process_product_result(raw)
+        assert product is not None
+        assert product.description == "Fallback desc from item"
+
+    def test_bff_format_completely_empty_description(self) -> None:
+        """BFF with no description anywhere returns empty string."""
+        raw = {
+            "data": {
+                "item": {
+                    "item_id": 11111,
+                    "shop_id": 22222,
+                    "title": "No Desc Product",
+                    "stock": 1,
+                    "condition": 1,
+                },
+                "product_price": {
+                    "price": {"single_value": 50000000000},
+                },
+                "product_images": {"images": []},
+                "shop_detailed": {},
+                "product_review": {},
+            }
+        }
+
+        product = self.bridge.process_product_result(raw)
+        assert product is not None
+        assert product.description == ""
+
+    def test_normalize_product_result(self) -> None:
+        """normalize_product_result() returns dict without transforming."""
+        raw = {
+            "data": {
+                "item": {
+                    "itemid": 44444,
+                    "shopid": 55555,
+                    "name": "Dict Product",
+                    "description": "test desc",
+                    "price": 200000000000,
+                    "price_min": 200000000000,
+                    "stock": 3,
+                    "images": ["hash1"],
+                    "item_rating": {"rating_star": 4.0, "rating_count": [0]},
+                    "cmt_count": 10,
+                },
+                "shop_info": {"name": "Shop A"},
+            }
+        }
+        result = self.bridge.normalize_product_result(raw)
+        assert isinstance(result, dict)
+        assert result["item_id"] == 44444
+        assert result["name"] == "Dict Product"
+        assert result["description"] == "test desc"
+
 
 class TestProcessReviewsResult:
     """Tests for processing raw reviews API responses."""

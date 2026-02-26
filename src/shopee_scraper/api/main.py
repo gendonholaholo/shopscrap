@@ -104,6 +104,15 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         )
         scraper_service.set_extension_manager(extension_manager)
         logger.info("Extension manager initialized")
+
+        # Initialize database and scrape logger if enabled
+        if settings.database.enabled:
+            from shopee_scraper.storage.database import init_db
+            from shopee_scraper.storage.scrape_logger import ScrapeLogger
+
+            await init_db(settings.database.url)
+            scraper_service.set_scrape_logger(ScrapeLogger())
+            logger.info("Database scrape logging enabled")
     except Exception as e:
         logger.warning(f"Failed to initialize job queue: {e}")
 
@@ -115,6 +124,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     await cleanup_job_queue()
     await cleanup_redis()
     await cleanup_scraper_service()
+
+    # Close database if it was initialized
+    from shopee_scraper.storage.database import close_db
+
+    await close_db()
 
 
 def setup_cors(app: FastAPI) -> None:

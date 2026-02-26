@@ -124,9 +124,9 @@ class NetworkInterceptor:
         existing = self._responses.get(url)
         if existing and existing.body_json:
             # Check if existing response has actual product data
-            has_items = (
-                "items" in existing.body_json
-                or ("data" in existing.body_json and "items" in existing.body_json.get("data", {}))
+            has_items = "items" in existing.body_json or (
+                "data" in existing.body_json
+                and "items" in existing.body_json.get("data", {})
             )
             if has_items:
                 logger.debug(

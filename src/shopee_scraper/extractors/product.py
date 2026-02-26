@@ -390,11 +390,184 @@ class ProductExtractor(BaseExtractor):
             return {}
 
     def parse(self, raw_data: dict[str, Any]) -> dict[str, Any]:
-        """Parse and structure product data from API."""
+        """Parse and structure product data from API.
+
+        Handles both legacy format (/api/v4/item/get) and BFF format
+        (/api/v4/pdp/get_pc with product_price sub-object).
+        """
         if not raw_data:
             return {}
 
-        # Get item info
+        # Detect BFF format
+        if raw_data.get("product_price"):
+            return self._parse_bff_format(raw_data)
+
+        return self._parse_legacy_format(raw_data)
+
+    def _parse_bff_format(self, raw_data: dict[str, Any]) -> dict[str, Any]:
+        """Parse BFF format from /api/v4/pdp/get_pc."""
+        item = raw_data.get("item", raw_data)
+
+        item_id = item.get("itemid", item.get("item_id", 0))
+        shop_id = item.get("shopid", item.get("shop_id", 0))
+
+        if not item_id:
+            return {}
+
+        # Price from product_price sub-object
+        product_price = raw_data.get("product_price", {})
+        price_obj = product_price.get("price", {})
+        single_val = price_obj.get("single_value", -1)
+        range_min = price_obj.get("range_min") or 0
+        range_max = price_obj.get("range_max") or range_min
+        price_raw = single_val if (single_val and single_val != -1) else range_min
+        price = (price_raw or 0) / PRICE_DIVISOR
+        price_max_val = (range_max or price_raw) / PRICE_DIVISOR
+
+        pbd_obj = product_price.get("price_before_discount", {})
+        pbd_single = pbd_obj.get("single_value", -1) if pbd_obj else -1
+        pbd_min = pbd_obj.get("range_min") or 0 if pbd_obj else 0
+        price_before_discount = (
+            (pbd_single if (pbd_single and pbd_single != -1) else pbd_min)
+            / PRICE_DIVISOR
+            if pbd_obj
+            else 0
+        )
+
+        # Images from product_images
+        pi = raw_data.get("product_images", {})
+        raw_images = pi.get("images", []) if isinstance(pi, dict) else []
+        image_urls: list[str] = []
+        for img in raw_images:
+            if isinstance(img, str):
+                image_urls.append(f"https://cf.shopee.co.id/file/{img}")
+            elif isinstance(img, dict):
+                img_hash = (
+                    img.get("image_url") or img.get("url") or img.get("img") or ""
+                )
+                if img_hash:
+                    image_urls.append(
+                        img_hash
+                        if img_hash.startswith("http")
+                        else f"https://cf.shopee.co.id/file/{img_hash}"
+                    )
+
+        # Shop from shop_detailed
+        shop_info = raw_data.get("shop_detailed", {})
+        shop_account = (
+            shop_info.get("account", {}) if isinstance(shop_info, dict) else {}
+        )
+
+        # Ratings from product_review
+        pr = raw_data.get("product_review", {})
+        rating = pr.get("rating_star") or item.get("item_rating", {}).get(
+            "rating_star", 0
+        )
+        rating_count = pr.get("total_rating_count") or pr.get("cmt_count") or 0
+        rating_breakdown = pr.get("rating_count", [])
+        sold = pr.get("historical_sold") or 0
+
+        # Stock
+        stock_val = item.get("stock") or item.get("normal_stock")
+        if stock_val is None:
+            is_available_str = item.get("stock_display", "")
+            stock_val = (
+                1 if is_available_str and is_available_str not in ("", "0") else 0
+            )
+
+        # Name
+        name = item.get("title") or item.get("name", "")
+
+        # Description: BFF puts it under product_detail
+        product_detail = raw_data.get("product_detail", {})
+        description = (
+            (
+                product_detail.get("description", "")
+                if isinstance(product_detail, dict)
+                else ""
+            )
+            or item.get("description")
+            or ""
+        )
+
+        # Variants/Models
+        models = item.get("models", [])
+        variants = []
+        for model in models:
+            model_price = (model.get("price") or 0) / PRICE_DIVISOR
+            variants.append(
+                {
+                    "model_id": model.get("modelid") or model.get("model_id") or 0,
+                    "name": model.get("name", ""),
+                    "price": model_price,
+                    "stock": model.get("stock") or 0,
+                    "sold": model.get("sold") or 0,
+                }
+            )
+
+        # Categories
+        categories = item.get("categories", [])
+        category_path = [cat.get("display_name", "") for cat in categories]
+
+        # Tier variations
+        tier_variations = item.get("tier_variations", [])
+        variations = []
+        for tier in tier_variations:
+            variations.append(
+                {
+                    "name": tier.get("name", ""),
+                    "options": tier.get("options", []),
+                }
+            )
+
+        return {
+            "item_id": item_id,
+            "shop_id": shop_id,
+            "name": name,
+            "description": description,
+            "price": price,
+            "price_min": price,
+            "price_max": price_max_val,
+            "price_before_discount": price_before_discount,
+            "stock": stock_val,
+            "sold": sold,
+            "rating": rating,
+            "rating_count": rating_count,
+            "rating_breakdown": rating_breakdown,
+            "images": image_urls,
+            "variants": variants,
+            "variations": variations,
+            "category_id": item.get("catid") or item.get("cat_id", 0),
+            "category_path": category_path,
+            "condition": "new" if item.get("condition", 1) == 1 else "used",
+            "shop": {
+                "shop_id": shop_id,
+                "name": (
+                    shop_info.get("name", "") if isinstance(shop_info, dict) else ""
+                ),
+                "username": shop_account.get("username", "") if shop_account else "",
+                "location": (
+                    shop_info.get("shop_location", "")
+                    if isinstance(shop_info, dict)
+                    else ""
+                ),
+                "rating": (
+                    shop_info.get("rating_star", 0)
+                    if isinstance(shop_info, dict)
+                    else 0
+                ),
+                "is_official": (
+                    shop_info.get("is_official_shop", False)
+                    if isinstance(shop_info, dict)
+                    else False
+                ),
+            },
+            "attributes": item.get("attributes", []),
+            "url": f"{BASE_URL}/product/{shop_id}/{item_id}",
+        }
+
+    def _parse_legacy_format(self, raw_data: dict[str, Any]) -> dict[str, Any]:
+        """Parse legacy format from /api/v4/item/get."""
         item = raw_data.get("item", raw_data)
 
         item_id = item.get("itemid", item.get("item_id", 0))
