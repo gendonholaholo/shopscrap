@@ -6,6 +6,8 @@ the same dict format that extractors produce, then calls transform_product().
 
 from __future__ import annotations
 
+import contextlib
+from datetime import datetime
 from typing import Any
 
 from shopee_scraper.models.output import ProductOutput
@@ -375,7 +377,7 @@ class ExtensionBridge:
             if rating.get("product_items")
             else "",
             "likes": rating.get("like_count", 0),
-            "created_at": rating.get("ctime", ""),
+            "created_at": self._format_ctime(rating.get("ctime", 0)),
             "is_anonymous": rating.get("anonymous", False),
             "shop_reply": rating.get("itemrpt", {}).get("cmt", "")
             if rating.get("itemrpt")
@@ -388,3 +390,12 @@ class ExtensionBridge:
                 else "",
             },
         }
+
+    @staticmethod
+    def _format_ctime(ctime: int | float) -> str:
+        """Convert Unix timestamp to ISO 8601 string (consistent with review.py)."""
+        if not ctime:
+            return ""
+        with contextlib.suppress(Exception):
+            return datetime.fromtimestamp(ctime).isoformat()
+        return ""
