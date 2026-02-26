@@ -10,7 +10,7 @@ Usage:
         reviews = await scraper.get_reviews(shop_id, item_id)
 """
 
-__version__ = "0.3.0"
+__version__ = "0.3.3"
 __author__ = "Your Name"
 
 from shopee_scraper.core.browser import BrowserManager
